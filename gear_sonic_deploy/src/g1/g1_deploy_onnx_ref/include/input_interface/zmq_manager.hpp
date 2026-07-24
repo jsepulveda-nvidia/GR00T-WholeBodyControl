@@ -444,6 +444,12 @@ class ZMQManager : public InputInterface {
       return InputInterface::GetLastUpdateTime();
     }
 
+    /// Return and consume the pending latency marker from the pose interface (0.0 if none).
+    double ConsumeLatencyMarkerTs() {
+      if (pose_interface_) return pose_interface_->ConsumeLatencyMarkerTs();
+      return 0.0;
+    }
+
   private:
     // Handle planner mode input (similar to GamepadManager::handleGamepadPlannerInput)
     void handlePlannerInput(MotionDataReader& motion_reader,

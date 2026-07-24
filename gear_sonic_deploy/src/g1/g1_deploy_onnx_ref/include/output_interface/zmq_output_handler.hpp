@@ -101,6 +101,7 @@
 
 #include <memory>
 #include <iostream>
+#include <iomanip>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -229,6 +230,9 @@ public:
         }
     }
 
+    /// Set the latency marker timestamp to include in the next g1_debug publish (profiling).
+    void SetLatencyMarkerTs(double ts) { pending_latency_marker_ts_ = ts; }
+
 private:
     zmq::context_t realtime_debug_context_;                ///< ZMQ context (1 I/O thread).
     std::unique_ptr<zmq::socket_t> realtime_debug_socket_; ///< ZMQ PUB socket.
@@ -242,6 +246,9 @@ private:
     static constexpr double CONFIG_REPUBLISH_INTERVAL_SEC = 2.0;
     msgpack::sbuffer config_sbuf_cache_;  ///< Serialised config (populated on first publish_config()).
     std::chrono::steady_clock::time_point config_last_publish_time_;
+
+    // -- Latency profiling --
+    double pending_latency_marker_ts_ = 0.0;
 
     /// Non-blocking send of [topic][msgpack payload] over the PUB socket.
     void send_zmq_message(const std::string& topic, const msgpack::sbuffer& sbuf) {
@@ -281,9 +288,11 @@ private:
 
         // State-logger fields: 18 base + 2 optional heading
         // Visualisation fields: output_data_map_.size() (typically 11)
+        // +1 optional latency profiling field
         int num_state_fields = has_heading_state ? 20 : 18;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        pk.pack_map(num_state_fields + num_viz_fields);
+        int num_latency_fields = (pending_latency_marker_ts_ > 0.0) ? 1 : 0;
+        pk.pack_map(num_state_fields + num_viz_fields + num_latency_fields);
 
         // ---- State-logger fields ----
 
@@ -392,6 +401,19 @@ private:
 
             pk.pack("delta_heading");
             pk.pack(heading_state.delta_heading);
+        }
+
+        // ---- Latency profiling field (optional) ----
+        if (pending_latency_marker_ts_ > 0.0) {
+            auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+            double now_s = static_cast<double>(now_ns) / 1e9;
+            double delta_ms = (now_s - pending_latency_marker_ts_) * 1000.0;
+            std::cout << "[LATENCY P2→] ts=" << std::fixed << std::setprecision(6)
+                      << pending_latency_marker_ts_
+                      << "  P3→P2→g1_debug=" << std::setprecision(2) << delta_ms << "ms" << std::endl;
+            pk.pack("latency_marker_ts");
+            pk.pack(pending_latency_marker_ts_);
+            pending_latency_marker_ts_ = 0.0;
         }
 
         // ---- Visualisation fields (from output_data_map_) ----

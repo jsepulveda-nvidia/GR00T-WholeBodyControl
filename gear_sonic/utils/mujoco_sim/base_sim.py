@@ -17,7 +17,9 @@ import xml.etree.ElementTree as ET
 
 import mujoco
 import mujoco.viewer
+import msgpack
 import numpy as np
+import zmq
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
@@ -573,6 +575,15 @@ class BaseSimulator:
         self.init_subscriber()
         self.init_publisher()
 
+        # Latency profiling: subscribe to Process 2's g1_debug stream on port 5557
+        self._latency_zmq_ctx = zmq.Context()
+        self._latency_zmq_sock = self._latency_zmq_ctx.socket(zmq.SUB)
+        self._latency_zmq_sock.setsockopt(zmq.RCVHWM, 1)
+        self._latency_zmq_sock.setsockopt(zmq.CONFLATE, 1)
+        self._latency_zmq_sock.setsockopt(zmq.LINGER, 0)
+        self._latency_zmq_sock.connect("tcp://localhost:5557")
+        self._latency_zmq_sock.setsockopt(zmq.SUBSCRIBE, b"g1_debug")
+
         self.sim_thread = None
 
     def start_as_thread(self):
@@ -624,6 +635,21 @@ class BaseSimulator:
                 if sim_cnt % int(self.image_dt / self.sim_dt) == 0:
                     self.sim_env.update_render_caches()
 
+                # Latency profiling: poll g1_debug from Process 2 for latency markers
+                try:
+                    raw = self._latency_zmq_sock.recv(flags=zmq.NOBLOCK)
+                    topic_len = len(b"g1_debug")
+                    data = msgpack.unpackb(raw[topic_len:], raw=False)
+                    marker_ts = data.get("latency_marker_ts", 0.0)
+                    if marker_ts and marker_ts > 0.0:
+                        total_ms = (time.monotonic() - marker_ts) * 1000.0
+                        print(
+                            f"[LATENCY →P1] ts={marker_ts:.6f}"
+                            f"  P3→P2→P1 total={total_ms:.2f}ms  (sim applied motor cmd)"
+                        )
+                except zmq.Again:
+                    pass
+
                 # Simple rate limiter (replaces ROS rate)
                 elapsed = time.monotonic() - step_start
                 sleep_time = self.sim_dt - elapsed
@@ -651,6 +677,11 @@ class BaseSimulator:
                 self.sim_env.viewer.close()
         except Exception as e:
             print(f"Warning during close: {e}")
+        try:
+            self._latency_zmq_sock.close()
+            self._latency_zmq_ctx.term()
+        except Exception:
+            pass
 
     def get_privileged_obs(self):
         return self.sim_env.get_privileged_obs()

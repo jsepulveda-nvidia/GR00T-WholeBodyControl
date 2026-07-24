@@ -3983,9 +3983,21 @@ class G1Deploy {
           
           auto hand_joint_end_time = std::chrono::steady_clock::now();
 
+          // Collect latency marker from ZMQManager (if applicable) for profiling
+          double latency_marker_ts = 0.0;
+          if (auto* zmq_mgr = dynamic_cast<ZMQManager*>(input_interface_.get())) {
+            latency_marker_ts = zmq_mgr->ConsumeLatencyMarkerTs();
+          }
+
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
           for (auto& output_interface : output_interfaces_) {
             if (output_interface) {
+              // Forward latency marker to ZMQ output for downstream measurement (Process 1)
+              if (latency_marker_ts > 0.0) {
+                if (auto* zmq_out = dynamic_cast<ZMQOutputHandler*>(output_interface.get())) {
+                  zmq_out->SetLatencyMarkerTs(latency_marker_ts);
+                }
+              }
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,

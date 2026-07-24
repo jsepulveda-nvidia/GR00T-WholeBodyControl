@@ -651,9 +651,10 @@ private:
         int token_state_idx = -1;  // Protocol v4: token-only streaming
         int heading_increment_idx = -1;
         int timestamp_monotonic_idx = -1;
+        int latency_marker_ts_idx = -1;
         // VR 3-point tracking fields (optional)
         int vr_position_idx = -1, vr_orientation_idx = -1, vr_compliance_idx = -1;
-        
+
         for (size_t i = 0; i < buffered_header_.fields.size(); ++i) {
             const auto& f = buffered_header_.fields[i];
             if (f.name == "joint_pos") joint_pos_idx = static_cast<int>(i);
@@ -668,6 +669,7 @@ private:
             else if (f.name == "token_state") token_state_idx = static_cast<int>(i);
             else if (f.name == "heading_increment") heading_increment_idx = static_cast<int>(i);
             else if (f.name == "timestamp_monotonic") timestamp_monotonic_idx = static_cast<int>(i);
+            else if (f.name == "latency_marker_ts") latency_marker_ts_idx = static_cast<int>(i);
             // VR 3-point tracking fields
             else if (f.name == "vr_position") vr_position_idx = static_cast<int>(i);
             else if (f.name == "vr_orientation") vr_orientation_idx = static_cast<int>(i);
@@ -1534,6 +1536,25 @@ private:
           }
         }
 
+        // ===== Decode latency_marker_ts if present (profiling only) =====
+        if (latency_marker_ts_idx >= 0) {
+          const auto& lm_buf = buffered_buffers_[latency_marker_ts_idx];
+          const auto& lm_field = buffered_header_.fields[latency_marker_ts_idx];
+          if (lm_field.dtype == "f64" && lm_buf.size() >= sizeof(double)) {
+            double val = 0.0;
+            std::memcpy(&val, lm_buf.data(), sizeof(double));
+            if (needs_swap) val = byte_swap(val);
+            if (val > 0.0) {
+              latest_latency_marker_ts_ = val;
+              auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+              double now_s = static_cast<double>(now_ns) / 1e9;
+              double delta_ms = (now_s - val) * 1000.0;
+              std::cout << "[LATENCY →P2] ts=" << std::fixed << std::setprecision(6) << val
+                        << "  P3→P2=" << std::setprecision(2) << delta_ms << "ms" << std::endl;
+            }
+          }
+        }
+
         // ===== Decode catch_up field if present =====
         // Default: catch_up = true (use MAX_GAP_FRAMES)
         // If catch_up = false: allow infinite delays (set max_gap_frames to very large value)
@@ -1859,7 +1880,18 @@ private:
     std::optional<std::chrono::steady_clock::time_point> last_receive_time_{}; ///< Timestamp of last OnPoseDataReceived (ms, monotonic).
     uint64_t receive_count_ = 0;       ///< Total number of messages received.
     uint64_t last_decode_time_ = 0;    ///< Timestamp of last DecodeIntoMotionSequence call (ms).
-    
+
+    /// Latest latency profiling marker timestamp (monotonic seconds from Process 3).
+    /// Non-zero only when a marked frame was most recently decoded; consumed by caller.
+    double latest_latency_marker_ts_ = 0.0;
+
+public:
+    /// Return and consume the pending latency marker (0.0 if none since last call).
+    double ConsumeLatencyMarkerTs() {
+        double ts = latest_latency_marker_ts_;
+        latest_latency_marker_ts_ = 0.0;
+        return ts;
+    }
 };
 
 #endif // ZMQ_ENDPOINT_INTERFACE_HPP

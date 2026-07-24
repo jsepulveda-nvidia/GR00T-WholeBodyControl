@@ -1322,6 +1322,11 @@ class PoseStreamer:
         )
         self.yaw_accumulator = YawAccumulator()
 
+        # Latency profiling: fire a marker every 5 seconds
+        self._latency_marker_interval = 5.0
+        self._next_marker_t = 0.0
+        self._marker_seq = 0
+
     def reset_yaw(self):
         """Called when entering pose mode. Resets yaw only.
         Calibration is triggered separately by the operator (A+B+X+Y → calibrate_now)."""
@@ -1508,6 +1513,19 @@ class PoseStreamer:
 
         # Only send if buffer is full and we're not waiting for fresh data
         if buffer_is_full and not self.buffer_cleared:
+            # Latency profiling: stamp a marker every _latency_marker_interval seconds
+            now_mono = time.monotonic()
+            if now_mono >= self._next_marker_t:
+                latency_marker_ts = now_mono
+                self._marker_seq += 1
+                self._next_marker_t = now_mono + self._latency_marker_interval
+                print(
+                    f"[LATENCY P3→] seq={self._marker_seq} ts={latency_marker_ts:.6f}"
+                    f"  body_pose → ZMQ port 5556"
+                )
+            else:
+                latency_marker_ts = 0.0
+
             numpy_data = {
                 "smpl_pose": np.stack((self.frame_buffer["smpl_pose"]), axis=0),
                 "smpl_joints": np.stack((self.frame_buffer["smpl_joints"]), axis=0),
@@ -1536,6 +1554,7 @@ class PoseStreamer:
                 "heading_increment": np.array(
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
                 ),
+                "latency_marker_ts": np.array([latency_marker_ts], dtype=np.float64),
             }
 
             packed_message = pack_pose_message(numpy_data, topic="pose")
