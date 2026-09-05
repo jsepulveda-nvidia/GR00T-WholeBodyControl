@@ -115,6 +115,17 @@ python gear_sonic/train_agent_trl.py \
     ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=<path/to/smpl_filtered>
 ```
 
+### Adaptive sampling attribution
+
+Adaptive sampling is enabled by default. A terminated environment is charged
+to the motion ID and frame bin it tracked during physics, before Isaac Lab
+resamples the environment. This prevents failures from being assigned to the
+newly drawn motion.
+
+After a few hundred iterations, `adp_samp/failure_rate_max` should separate
+from `adp_samp/failure_rate_mean`; values that remain nearly identical are a
+strong signal that failures are still being attributed after reset.
+
 ### Multi-GPU and multi-node training
 
 We recommend training with **64+ GPUs** for reasonable convergence times.

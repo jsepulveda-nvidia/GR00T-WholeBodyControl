@@ -93,8 +93,14 @@ cd gear_sonic_deploy
     --cp policy/sonic_v1_1/model \
     --obs-config policy/sonic_v1_1/observation_config.yaml \
     --input-type zmq_manager \
+    --motor-kp-scale 4,10=1.5 \
+    --motor-kd-scale 4,10=1.5 \
     real
 ```
+
+This v1.1 tuning scales the left and right ankle-pitch motors (hardware
+indices `4` and `10`). The resulting whole-body stability improves observed
+wrist tracking; it does not directly scale the wrist motors.
 
 Or pass the same model pair to the Python launcher:
 
@@ -102,6 +108,8 @@ Or pass the same model pair to the Python launcher:
 python gear_sonic/scripts/launch_inference.py \
     --deploy-checkpoint policy/sonic_v1_1/model \
     --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
+    --deploy-motor-kp-scale 4,10=1.5 \
+    --deploy-motor-kd-scale 4,10=1.5 \
     --camera-host 192.168.123.164 \
     --prompt "pick up the cup"
 ```
@@ -299,6 +307,8 @@ python gear_sonic/scripts/run_data_exporter.py \
 ### tmux Launcher (`launch_inference.py`)
 
 The launcher exposes all the above flags plus deploy and data exporter options.
+Use `--deploy-motor-kp-scale` and `--deploy-motor-kd-scale` to forward hardware
+gain specifications to the C++ controller.
 Run `python gear_sonic/scripts/launch_inference.py --help` for the full list.
 
 ## Remote PolicyServer

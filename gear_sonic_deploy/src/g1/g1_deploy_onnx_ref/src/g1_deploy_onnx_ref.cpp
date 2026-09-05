@@ -44,6 +44,8 @@
  *   --disable-crc-check   | Skip CRC validation (for MuJoCo sim)
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
+ *   --motor-kp-scale      | Scale selected hardware motor Kp gains
+ *   --motor-kd-scale      | Scale selected hardware motor Kd gains
  */
 #include <cmath>
 #include <cuda_runtime_api.h>
@@ -101,6 +103,7 @@
 // Robot parameters
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
+#include "../include/motor_gain_scaling.hpp"
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -295,6 +298,7 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     ProgramState program_state_;
+    MotorGainScaleConfig motor_gain_scales_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
@@ -2159,7 +2163,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      MotorGainScaleConfig motor_gain_scales = {})
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2171,6 +2176,7 @@ class G1Deploy {
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
         program_state_(ProgramState::INIT),
+        motor_gain_scales_(motor_gain_scales),
         last_action {0.0},
         last_left_hand_action {0.0},
         last_right_hand_action {0.0},
@@ -2180,6 +2186,17 @@ class G1Deploy {
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
+
+      const auto kp_scales = format_motor_gain_scales(motor_gain_scales_.kp);
+      const auto kd_scales = format_motor_gain_scales(motor_gain_scales_.kd);
+      if (!kp_scales.empty()) {
+        std::cout << "[INFO] Motor Kp scales (hardware indices): "
+                  << kp_scales << std::endl;
+      }
+      if (!kd_scales.empty()) {
+        std::cout << "[INFO] Motor Kd scales (hardware indices): "
+                  << kd_scales << std::endl;
+      }
       
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
@@ -3128,6 +3145,7 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
     }
@@ -4082,6 +4100,23 @@ class G1Deploy {
     }
 };
 
+static bool parse_motor_gain_scale_flag(
+    int argc, char const* argv[], int& index,
+    std::span<std::optional<float>, G1_NUM_MOTOR> scales) {
+  const char* flag = argv[index];
+  if (index + 1 >= argc) {
+    std::cerr << "Error: " << flag << " requires <motor-list>=<factor>"
+              << std::endl;
+    return false;
+  }
+  const auto error = add_motor_gain_scale(argv[++index], scales);
+  if (error) {
+    std::cerr << "Error: invalid " << flag << ": " << *error << std::endl;
+    return false;
+  }
+  return true;
+}
+
 /**
  * @brief Entry point: parse CLI arguments and run the G1 deployment application.
  *
@@ -4121,6 +4156,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
     std::cout << "  --policy-precision <16|32>: specify precision to run the policy model at (default: 32)" << std::endl;
+    std::cout << "  --motor-kp-scale <motors>=<factor>: scale Kp for hardware motor indices/ranges" << std::endl;
+    std::cout << "  --motor-kd-scale <motors>=<factor>: scale Kd for hardware motor indices/ranges" << std::endl;
     std::cout << "  --zmq-host <host>: ZMQ server host (default: localhost)" << std::endl;
     std::cout << "  --zmq-port <port>: ZMQ server port (default: 5556)" << std::endl;
     std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
@@ -4180,6 +4217,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  MotorGainScaleConfig motor_gain_scales;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4332,6 +4370,14 @@ int main(int argc, char const* argv[]) {
       else{
         std::cerr << "old and weak" << std::endl;
       }
+    } else if (std::string(argv[i]) == "--motor-kp-scale") {
+      if (!parse_motor_gain_scale_flag(argc, argv, i, motor_gain_scales.kp)) {
+        return 1;
+      }
+    } else if (std::string(argv[i]) == "--motor-kd-scale") {
+      if (!parse_motor_gain_scale_flag(argc, argv, i, motor_gain_scales.kd)) {
+        return 1;
+      }
     } else if (std::string(argv[i]) == "--enable-csv-logs") {
       enableCsvLogs = true;
       std::cout << "[INFO] CSV logging enabled" << std::endl;
@@ -4441,7 +4487,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    motor_gain_scales
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4468,4 +4515,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

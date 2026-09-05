@@ -235,7 +235,7 @@ class MotionLibBase:
         logger.info(f"Loaded skeleton from {skeleton_file}")
         logger.info(f"Loading motion data from {self.m_cfg.motion_file}...")
         self.load_data(self.m_cfg.motion_file)
-        self.use_adaptive_sampling = self.adaptive_sampling_cfg.get("enable", False)
+        self.use_adaptive_sampling = self.adaptive_sampling_cfg.get("enable", True)
         if self.use_adaptive_sampling:
             self.init_adaptive_sampling()
         self.setup_constants(

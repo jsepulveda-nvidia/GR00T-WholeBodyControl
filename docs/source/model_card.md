@@ -40,6 +40,10 @@ latency, which also includes sensing, networking, preprocessing, and inference.
 | Low-latency teleoperation | `low_latency/model_encoder.onnx`, `low_latency/model_decoder.onnx`, `low_latency/observation_config.yaml` | `low_latency/last.pt`, `low_latency/config.yaml`, `low_latency/model_config.yaml` |
 | SONIC v1.1 | `sonic_v1_1/model_encoder.onnx`, `sonic_v1_1/model_decoder.onnx`, `sonic_v1_1/observation_config.yaml` | `sonic_v1_1/last.pt`, `sonic_v1_1/config.yaml`, `sonic_v1_1/model_config.yaml` |
 
+The root [`config.json`](https://huggingface.co/nvidia/GEAR-SONIC/blob/main/config.json)
+is the canonical release manifest for the variants and shared artifacts. The
+official downloader fetches and validates it before downloading model files.
+
 All files are hosted in
 [`nvidia/GEAR-SONIC`](https://huggingface.co/nvidia/GEAR-SONIC). Model weights
 are covered by the [NVIDIA Open Model License](resources/license.md).
@@ -98,8 +102,14 @@ cd gear_sonic_deploy
     --cp policy/sonic_v1_1/model \
     --obs-config policy/sonic_v1_1/observation_config.yaml \
     --input-type zmq_manager \
+    --motor-kp-scale 4,10=1.5 \
+    --motor-kd-scale 4,10=1.5 \
     real
 ```
+
+The gain flags are the tested v1.1 hardware tuning. Motor indices `4` and
+`10` are the left and right ankle-pitch motors; the additional stiffness
+improves whole-body stability and observed wrist tracking. Scaling is opt-in.
 
 ### Python VLA Launcher
 
@@ -122,7 +132,12 @@ python gear_sonic/scripts/launch_inference.py \
 ```
 
 For SONIC v1.1, replace the two `policy/low_latency/` paths above with
-`policy/sonic_v1_1/`.
+`policy/sonic_v1_1/` and add:
+
+```text
+--deploy-motor-kp-scale 4,10=1.5
+--deploy-motor-kd-scale 4,10=1.5
+```
 
 See [Downloading Model Checkpoints](getting_started/download_models.md) for
 PyTorch checkpoint evaluation and additional download options.

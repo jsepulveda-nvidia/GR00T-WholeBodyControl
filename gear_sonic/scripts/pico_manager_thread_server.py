@@ -558,16 +558,51 @@ class YawAccumulator:
         return self.heading
 
 
-def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndarray):
+def load_wrist_bias(skeleton_source: str):
+    """Return ((L roll, L pitch, L yaw), (R roll, R pitch, R yaw)) in radians.
+
+    Added to the commanded G1 wrist joints. The table lives upstream in
+    isaacteleop.retargeters.G1 (NVIDIA/IsaacTeleop#921), beside the skeleton
+    correction it complements, so other stacks driving a G1 from the same
+    corrected skeleton get it too. See that module for how the values were
+    measured and why Pico is deliberately zero.
+    """
+    try:
+        from isaacteleop.retargeters.G1 import wrist_bias_for
+    except ImportError as exc:
+        raise input_readers.SkeletonCorrectionUnavailable(
+            "the isaacteleop G1 wrist bias is not available.\n"
+            "  Run ./install_scripts/install_isaacteleop_skeleton_correction.sh "
+            "with ~/IsaacTeleop on jsepulveda/quest_remapping."
+        ) from exc
+
+    bias = wrist_bias_for(skeleton_source or "pico")
+    if any(any(side) for side in bias):
+        d = lambda v: ", ".join(f"{np.degrees(x):+.1f}" for x in v)  # noqa: E731
+        print(
+            f"[skeleton] wrist bias for {skeleton_source!r} (roll, pitch, yaw deg): "
+            f"L [{d(bias[0])}]  R [{d(bias[1])}] "
+            "(neutral alignment; roll is zeroed rather than Pico-matched -- see "
+            "isaacteleop.retargeters.G1.wrist_bias)"
+        )
+    return bias
+
+
+def compute_from_body_poses(
+    parent_indices: list, device, body_poses_np: np.ndarray
+):
     """
     Compute local joints and body orientation from provided body_poses_np.
+
+    Orientations arrive already on the Pico convention: a non-Pico skeleton is
+    corrected upstream by isaacteleop, in the reader.
     """
     positions = body_poses_np[:, :3]
     global_quats = body_poses_np[:, [6, 3, 4, 5]]
 
     # Convert to local rotations
-    global_rots = sRot.from_quat(global_quats, scalar_first=True)
-    global_rots = global_rots * sRot.from_euler("y", 180, degrees=True)
+    raw_global_rots = sRot.from_quat(global_quats, scalar_first=True)
+    global_rots = raw_global_rots * sRot.from_euler("y", 180, degrees=True)
 
     local_rots = []
     for i in range(24):
@@ -576,6 +611,10 @@ def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndar
         else:
             local_rot = global_rots[parent_indices[i]].inv() * global_rots[i]
             local_rots.append(local_rot)
+
+    # Rebase onto the Pico convention. Applied here, after the local rotations
+    # exist and before they become the SMPL pose, because that is the space the
+    # offsets were measured in.
 
     pose_aa = np.array([rot.as_rotvec() for rot in local_rots])
 
@@ -1249,6 +1288,11 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        # Manager mode always passes this through from --skeleton-source. This
+        # default governs the non-manager path, which _pose_stream_common leaves
+        # unset: "pico" keeps that path uncorrected, matching the flag's
+        # documented "Manager mode only" scope.
+        skeleton_source: str = "pico",
     ):
         self.socket = socket
         self.reader = reader
@@ -1270,6 +1314,20 @@ class PoseStreamer:
         self.record_idx = 0
 
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        # Detection lives in the reader (the OpenXR Extension Method, resolved
+        # live every frame -- see IsaacTeleopReader._run()), which sees raw frames
+        # in every stream mode. The manager only follows its decision, so the
+        # wrist bias tracks the headset. Kept reactive (checked every run_once(),
+        # not just once) because the resolved source can change mid-session: an
+        # operator in auto mode may switch XR displays without restarting.
+        self.skeleton_source_mode = skeleton_source
+        self._last_resolved_skeleton_source = None
+        # The skeleton correction itself lives upstream, in the reader. Only the
+        # wrist bias stays here: it is expressed in G1 wrist joint commands, not
+        # in skeleton space, so it is robot-specific rather than headset-specific.
+        self.wrist_bias = load_wrist_bias(
+            "pico" if skeleton_source == "auto" else skeleton_source
+        )
         self.parent_indices = [
             -1,
             0,
@@ -1345,8 +1403,17 @@ class PoseStreamer:
             time.sleep(0.005)
             return
 
+        if self.skeleton_source_mode == "auto":
+            resolved = getattr(self.reader, "resolved_skeleton_source", None)
+            if resolved is not None and resolved != self._last_resolved_skeleton_source:
+                print(f"[skeleton] auto mode: source is now {resolved!r} (OpenXR Extension Method)")
+                self.wrist_bias = load_wrist_bias(resolved)
+                self._last_resolved_skeleton_source = resolved
+
         latest_data = compute_from_body_poses(
-            self.parent_indices, self.device, sample["body_poses_np"]
+            self.parent_indices,
+            self.device,
+            sample["body_poses_np"],
         )
         left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
             self.reader
@@ -1468,12 +1535,16 @@ class PoseStreamer:
         g1_r_wrist_yaw = r_elbow_swing_euler[:, 2] + r_wrist_euler[:, 2]
 
         joint_pos[G1_L_WRIST_ROLL_IDX] = g1_l_wrist_roll[0]
-        joint_pos[G1_L_WRIST_PITCH_IDX] = -g1_l_wrist_pitch[0]
-        joint_pos[G1_L_WRIST_YAW_IDX] = g1_l_wrist_yaw[0]
+        # Bias is per-headset and additive on the commanded joints; it aligns a
+        # non-Pico source with the Pico's tuned neutral. Zero for Pico.
+        (lb_roll, lb_pitch, lb_yaw), (rb_roll, rb_pitch, rb_yaw) = self.wrist_bias
+        joint_pos[G1_L_WRIST_ROLL_IDX] = g1_l_wrist_roll[0] + lb_roll
+        joint_pos[G1_L_WRIST_PITCH_IDX] = -g1_l_wrist_pitch[0] + lb_pitch
+        joint_pos[G1_L_WRIST_YAW_IDX] = g1_l_wrist_yaw[0] + lb_yaw
 
-        joint_pos[G1_R_WRIST_ROLL_IDX] = g1_r_wrist_roll[0]
-        joint_pos[G1_R_WRIST_PITCH_IDX] = g1_r_wrist_pitch[0]
-        joint_pos[G1_R_WRIST_YAW_IDX] = g1_r_wrist_yaw[0]
+        joint_pos[G1_R_WRIST_ROLL_IDX] = g1_r_wrist_roll[0] + rb_roll
+        joint_pos[G1_R_WRIST_PITCH_IDX] = g1_r_wrist_pitch[0] + rb_pitch
+        joint_pos[G1_R_WRIST_YAW_IDX] = g1_r_wrist_yaw[0] + rb_yaw
 
         # Process SMPL pose to get calibrated 3-point VR pose and update visualization
         # Pass SMPL local joints for optional body visualization in the VR3Pt viewer
@@ -1568,10 +1639,14 @@ class PoseStreamer:
 def _init_input_source(
     input_source: str,
     buffer_size: int,
+    skeleton_profile: str | None = None,
 ) -> "PicoReader | input_readers.IsaacTeleopReader":
     """Create, start, and wait for readiness of the requested teleop input source."""
     if input_source == "isaac-teleop":
-        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size)
+        reader = input_readers.IsaacTeleopReader(
+            max_queue_size=buffer_size,
+            skeleton_profile=skeleton_profile,
+        )
         reader.start()
         print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
         while reader.get_latest() is None:
@@ -1611,7 +1686,11 @@ def run_pico(
     input_source: str = "xrt",
 ):
     """Run body tracking with real-time visualization and ZMQ streaming."""
-    reader = _init_input_source(input_source, buffer_size)
+    reader = _init_input_source(
+        input_source,
+        buffer_size,
+        skeleton_profile=skeleton_source if skeleton_source in ("quest", "auto") else None,
+    )
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
@@ -1912,6 +1991,7 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    skeleton_source: str = "auto",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1919,7 +1999,11 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
-    reader = _init_input_source(input_source, buffer_size)
+    reader = _init_input_source(
+        input_source,
+        buffer_size,
+        skeleton_profile=skeleton_source if skeleton_source in ("quest", "auto") else None,
+    )
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1953,6 +2037,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        skeleton_source=skeleton_source,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2251,6 +2336,21 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--skeleton-source",
+        type=str,
+        default="auto",
+        choices=["auto", "pico", "quest"],
+        help=(
+            "Headset providing body tracking. 'auto' (default) identifies it from "
+            "the first frames of body tracking -- about five frames, with no delay "
+            "to startup -- and applies the matching correction; if it cannot tell, "
+            "it leaves the skeleton uncorrected and says so. 'pico' uses the native "
+            "ByteDance skeleton with no correction. 'quest' applies the isaacteleop "
+            "per-joint orientation correction in the reader. Pass an explicit value "
+            "to pin the behaviour. Manager mode only."
+        ),
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2292,6 +2392,7 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            skeleton_source=args.skeleton_source,
         )
     else:
         # Run legacy single-thread pose streaming

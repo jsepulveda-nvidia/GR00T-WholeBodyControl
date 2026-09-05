@@ -31,6 +31,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 
 ## News
 
+- **[2026-08-31]** **SONIC deployment update** — added per-motor Kp/Kd scaling to reduce stumbling.
 - **[2026-07-23]** **SONIC v1.1 checkpoint** — released a robot-heading-normalized SONIC controller trained with wrist-pose augmentation for whole-body teleoperation and SONIC-backed VLA execution. See the [Model Card](#model-card) and [Download Models](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/download_models.html#sonic-v11-checkpoint).
 - **[06/16]** **Isaac Teleop Setup (CloudXR / DeviceIO, in-process)** — added bring-up docs for the in-process CloudXR path via `isaacteleop[cloudxr]`, with no separate publisher container. See [Isaac Teleop Setup](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/isaac_teleop_publisher_setup.html).
 - **[2026-06-16]** **Low-latency teleoperation checkpoint** — released a SONIC checkpoint with 4-frame SMPL reference lookahead for more responsive whole-body teleoperation. See the [Model Card](#model-card), [Download Models](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/download_models.html#low-latency-teleoperation-checkpoint), and [VLA Inference](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vla_inference.html#low-latency-teleoperation-checkpoint).
@@ -104,6 +105,10 @@ The lookahead values describe the reference horizon presented to the controller.
 | Low-latency teleoperation | `low_latency/model_encoder.onnx`, `low_latency/model_decoder.onnx`, `low_latency/observation_config.yaml` | `low_latency/last.pt`, `low_latency/config.yaml`, `low_latency/model_config.yaml` |
 | SONIC v1.1 | `sonic_v1_1/model_encoder.onnx`, `sonic_v1_1/model_decoder.onnx`, `sonic_v1_1/observation_config.yaml` | `sonic_v1_1/last.pt`, `sonic_v1_1/config.yaml`, `sonic_v1_1/model_config.yaml` |
 
+The root [`config.json`](https://huggingface.co/nvidia/GEAR-SONIC/blob/main/config.json)
+is the canonical release manifest for these variants and shared artifacts. The
+official downloader fetches and validates it before downloading model files.
+
 ### Usage
 
 Download the default model and planner:
@@ -150,8 +155,15 @@ cd gear_sonic_deploy
     --cp policy/sonic_v1_1/model \
     --obs-config policy/sonic_v1_1/observation_config.yaml \
     --input-type zmq_manager \
+    --motor-kp-scale 4,10=1.5 \
+    --motor-kd-scale 4,10=1.5 \
     real
 ```
+
+This is the tested SONIC v1.1 deployment tuning. Hardware indices `4` and
+`10` are the left and right ankle-pitch motors; increasing their control gains
+improves whole-body stability and, in practice, wrist tracking. The flags are
+opt-in and do not alter other checkpoints.
 
 Run the default Python VLA launcher, which orchestrates the C++ controller and Python inference client:
 
@@ -171,8 +183,17 @@ python gear_sonic/scripts/launch_inference.py \
     --prompt "pick up the cup"
 ```
 
-For SONIC v1.1, use `policy/sonic_v1_1/model` and its matching
-`policy/sonic_v1_1/observation_config.yaml` in the same launcher flags.
+For SONIC v1.1, use the matching model/config and gain tuning:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/sonic_v1_1/model \
+    --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
+    --deploy-motor-kp-scale 4,10=1.5 \
+    --deploy-motor-kd-scale 4,10=1.5 \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
 
 See [Downloading Model Checkpoints](docs/source/getting_started/download_models.md#sonic-v11-checkpoint) for Python checkpoint evaluation and additional deployment options. Test in simulation before using the checkpoint on a physical robot.
 
@@ -310,6 +331,9 @@ accelerate launch --num_processes=8 gear_sonic/train_agent_trl.py \
     ++manager_env.commands.motion.motion_lib_cfg.motion_file=data/motion_lib_bones_seed/robot_filtered \
     ++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=data/smpl_filtered
 ```
+
+Adaptive sampling is enabled by default and attributes failures to the motion
+cursor tracked before environment reset.
 
 For the full guide including multi-node training, evaluation, ONNX export, and SOMA encoder setup:
 📖 [Installation (Training)](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/installation_training.html) |

@@ -44,6 +44,8 @@ python download_from_hf.py --training --no-smpl
 
 This downloads the **latest** policy encoder + decoder + kinematic planner into
 `gear_sonic_deploy/`, preserving the same directory layout the deployment binary expects.
+Each command first fetches the repository-level `config.json` release manifest
+and validates the selected model layout before downloading model files.
 
 ---
 
@@ -215,8 +217,15 @@ cd gear_sonic_deploy
 ./deploy.sh \
     --cp policy/sonic_v1_1/model \
     --obs-config policy/sonic_v1_1/observation_config.yaml \
+    --motor-kp-scale 4,10=1.5 \
+    --motor-kd-scale 4,10=1.5 \
     sim
 ```
+
+The gain settings are the tested v1.1 hardware tuning. Indices `4` and `10`
+refer to the left and right ankle-pitch motors; the change improves whole-body
+stability and observed wrist tracking. They remain explicit so other model
+variants retain their original gains.
 
 For the VLA launcher:
 
@@ -224,6 +233,8 @@ For the VLA launcher:
 python gear_sonic/scripts/launch_inference.py \
     --deploy-checkpoint policy/sonic_v1_1/model \
     --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
+    --deploy-motor-kp-scale 4,10=1.5 \
+    --deploy-motor-kd-scale 4,10=1.5 \
     --camera-host 192.168.123.164 \
     --prompt "pick up the cup"
 ```
@@ -261,6 +272,7 @@ pip install huggingface_hub[cli]
 
 # Policy only
 hf download nvidia/GEAR-SONIC \
+    config.json \
     model_encoder.onnx \
     model_decoder.onnx \
     observation_config.yaml \
@@ -279,14 +291,16 @@ from huggingface_hub import hf_hub_download
 
 REPO_ID = "nvidia/GEAR-SONIC"
 
+manifest = hf_hub_download(repo_id=REPO_ID, filename="config.json")
 encoder = hf_hub_download(repo_id=REPO_ID, filename="model_encoder.onnx")
 decoder = hf_hub_download(repo_id=REPO_ID, filename="model_decoder.onnx")
-config  = hf_hub_download(repo_id=REPO_ID, filename="observation_config.yaml")
+obs_config = hf_hub_download(repo_id=REPO_ID, filename="observation_config.yaml")
 planner = hf_hub_download(repo_id=REPO_ID, filename="planner_sonic.onnx")
 
+print("Release manifest:", manifest)
 print("Policy encoder :", encoder)
 print("Policy decoder :", decoder)
-print("Obs config     :", config)
+print("Obs config     :", obs_config)
 print("Planner        :", planner)
 ```
 
@@ -300,6 +314,7 @@ The SONIC release training checkpoint and config are also available on Hugging F
 
 ```bash
 hf download nvidia/GEAR-SONIC \
+    config.json \
     sonic_release/last.pt \
     sonic_release/config.yaml \
     --local-dir models
@@ -312,11 +327,13 @@ from huggingface_hub import hf_hub_download
 
 REPO_ID = "nvidia/GEAR-SONIC"
 
+manifest = hf_hub_download(repo_id=REPO_ID, filename="config.json")
 checkpoint = hf_hub_download(repo_id=REPO_ID, filename="sonic_release/last.pt")
-config = hf_hub_download(repo_id=REPO_ID, filename="sonic_release/config.yaml")
+training_config = hf_hub_download(repo_id=REPO_ID, filename="sonic_release/config.yaml")
 
+print("Manifest   :", manifest)
 print("Checkpoint :", checkpoint)
-print("Config     :", config)
+print("Config     :", training_config)
 ```
 
 ### Evaluate the checkpoint
@@ -338,11 +355,13 @@ A small sample dataset (1 walking sequence) is included for quick testing withou
 ```bash
 # Sample data only
 hf download nvidia/GEAR-SONIC \
+    --include "config.json" \
     --include "sample_data/*" \
     --local-dir .
 
 # Sample data + training checkpoint
 hf download nvidia/GEAR-SONIC \
+    --include "config.json" \
     --include "sample_data/*" \
     --include "sonic_release/*" \
     --local-dir .
@@ -385,7 +404,10 @@ The SMPL retargeted motion data used for training (131K sequences, filtered from
 
 ```bash
 # Download all parts
-hf download nvidia/GEAR-SONIC --include "bones_seed_smpl/*" --local-dir .
+hf download nvidia/GEAR-SONIC \
+    --include "config.json" \
+    --include "bones_seed_smpl/*" \
+    --local-dir .
 
 # Reassemble and extract
 cat bones_seed_smpl/bones_seed_smpl.tar.part_* | tar xf - -C data/
@@ -409,6 +431,7 @@ python gear_sonic/train_agent_trl.py \
 
 ```
 nvidia/GEAR-SONIC/
+├── config.json                       # Release manifest and model layout
 ├── model_encoder.onnx                # Policy encoder (ONNX, for deployment)
 ├── model_decoder.onnx                # Policy decoder (ONNX, for deployment)
 ├── observation_config.yaml           # Observation configuration (deployment)

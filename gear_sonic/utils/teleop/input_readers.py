@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from gear_sonic.utils.teleop.skeleton_source_detect import TrackersDisconnectedDetector, classify
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -22,6 +24,10 @@ try:
     from gear_sonic.utils.teleop.isaac_teleop_client import IsaacTeleopClient
 except ImportError:
     IsaacTeleopClient = None
+
+# Minimum time between repeated "degenerate skeleton" log lines. Every degenerate
+# frame is still refused regardless of this; it only throttles the ERROR spam.
+_DEGENERATE_LOG_INTERVAL_NS = 2_000_000_000
 
 
 class PicoReader:
@@ -212,7 +218,7 @@ def _log_unrecognised_schema_once(body_data: Any) -> None:
 
 
 def _body_data_to_24x7(body_data: Any) -> np.ndarray | None:
-    """Convert ``FullBodyTrackerPico.get_body_pose().data`` to a (24, 7) array.
+    """Convert ``FullBodyTracker.get_body_pose()`` to a (24, 7) array.
 
     Returns ``None`` while no joint is valid (typical when the headset isn't
     connected yet — every ``BodyJointPose.is_valid`` is False, the streamer
@@ -340,6 +346,26 @@ def _build_controller_dict(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     return out
 
 
+class SkeletonCorrectionUnavailable(RuntimeError):
+    """The isaacteleop skeleton correction is needed but not importable."""
+
+
+# Deliberately actionable rather than a bare ImportError. The correction ships in
+# isaacteleop 1.5+, while this repo pins 1.3.131, so on any machine that has not
+# been bridged the import is the first thing a Quest operator hits.
+_BRIDGE_MESSAGE = (
+    "the isaacteleop skeleton correction is not available, so a {profile!r} "
+    "skeleton cannot be corrected.\n"
+    "  Driving a robot from an uncorrected Quest skeleton gives it permuted "
+    "joint axes, so this refuses rather than continuing.\n"
+    "  Fix it with:\n"
+    "      git -C ~/IsaacTeleop checkout jsepulveda/quest_remapping\n"
+    "      ./install_scripts/install_isaacteleop_skeleton_correction.sh\n"
+    "  Or run with --skeleton-source pico if you are on a PICO headset.\n"
+    "  (PICO needs no correction and is unaffected by this.)"
+)
+
+
 class IsaacTeleopReader:
     """Background reader using the in-process IsaacTeleop / CloudXR DeviceIO session.
 
@@ -356,8 +382,52 @@ class IsaacTeleopReader:
         max_queue_size: int = 15,
         use_adb: bool = False,
         poll_hz: float = 90.0,
+        skeleton_profile: str | None = None,
     ):
         del max_queue_size
+
+        # The skeleton correction is applied here, by isaacteleop, on the raw
+        # ByteDance orientations. Downstream code sees corrected data and must not
+        # correct again.
+        #
+        # None means pass the skeleton through untouched, which is both what a
+        # PICO needs and what --skeleton-source auto needs before the first frame
+        # resolves it. _apply_resolved_source installs the correction once
+        # resolved.
+        self._skeleton_profile = None
+        self._correct_fn = None
+
+        # Resolution happens here rather than in a consumer, and that placement is
+        # load-bearing. The correction has to be settled before anything
+        # downstream latches a reference from the skeleton --
+        # ThreePointPose.calibrate_now() captures a neck frame once and never
+        # recaptures it. Resolving in a consumer that only runs in one stream mode
+        # meant calibration could happen first, on uncorrected data, and the
+        # global orientation then jumped ~121 deg when the correction arrived.
+        #
+        # "auto" (or unset) resolves live, every frame, from the OpenXR Extension
+        # Method: which full-body vendor tracker (body.pico-xr / body.quest-cloudxr)
+        # actually delivered active data this frame is a fact the runtime states,
+        # not an inference -- see IsaacTeleopClient._get_tracker_data()'s
+        # "full_body_source". This supersedes the old geometry-based detector
+        # (AutoSkeletonSource); geometry is repurposed below as a degeneracy
+        # guard instead. An explicit --skeleton-source pico|quest is honored
+        # regardless of what the extension reports, and never changes for the
+        # life of this reader.
+        self._manual_skeleton_source: str | None = None
+        self._fatal: Exception | None = None
+        self.resolved_skeleton_source = None
+        self._last_degenerate_log_ns = 0
+        self._last_seen_full_body_source: str | None = "<unset>"  # sentinel so the first frame always logs
+
+        # Pico "motion trackers disconnected" guard (skeleton_source_detect.py):
+        # a separate, temporal check from the geometry mismatch guard above --
+        # see that guard's comment in _run() for why the two are independent.
+        self._trackers_disconnected_detector = TrackersDisconnectedDetector()
+        self._last_trackers_disconnected_log_ns = 0
+        if skeleton_profile != "auto":
+            self._manual_skeleton_source = skeleton_profile or "pico"
+            self._apply_resolved_source(self._manual_skeleton_source)
 
         if IsaacTeleopClient is None:
             raise RuntimeError(
@@ -382,6 +452,46 @@ class IsaacTeleopReader:
         self._disconnected = threading.Event()
         self._unrecognised_logged = False
 
+
+    def set_skeleton_profile(self, profile: str | None) -> None:
+        """Install (or clear) the skeleton correction applied to incoming frames.
+
+        Safe to call while the reader thread is running: the correction is a
+        single attribute read per frame, so the worst case is one frame either
+        side of the change.
+        """
+        if not profile:
+            self._skeleton_profile, self._correct_fn = None, None
+            return
+        try:
+            from isaacteleop.retargeting_engine.utilities import correct_body_orientations
+        except ImportError as exc:
+            raise SkeletonCorrectionUnavailable(_BRIDGE_MESSAGE.format(profile=profile)) from exc
+
+        self._skeleton_profile = profile
+        self._correct_fn = correct_body_orientations
+        logger.info(
+            "[IsaacTeleopReader] applying isaacteleop skeleton correction (profile=%s)",
+            profile,
+        )
+
+    def _apply_resolved_source(self, source: str) -> None:
+        """Install (or clear) the skeleton correction for ``source`` and record it.
+
+        Called once for an explicit ``--skeleton-source``, and from ``_run()``
+        whenever the OpenXR Extension Method's resolved source changes from the
+        previously installed one -- including switching back and forth at
+        runtime as the operator changes XR displays mid-session.
+
+        Raises:
+            SkeletonCorrectionUnavailable: if ``source`` needs a correction
+                (i.e. is not "pico") and isaacteleop does not provide one.
+        """
+        if source == self.resolved_skeleton_source:
+            return
+        self.set_skeleton_profile(None if source == "pico" else source)
+        self.resolved_skeleton_source = source
+
     def start(self) -> None:
         self._client.start_streaming()
         if not self._thread.is_alive():
@@ -397,6 +507,10 @@ class IsaacTeleopReader:
             logger.exception("Failed to close IsaacTeleopClient cleanly")
 
     def get_latest(self) -> dict[str, Any] | None:
+        # Raised here, not in the reader thread, so it reaches the caller rather
+        # than dying silently in a background thread.
+        if self._fatal is not None:
+            raise self._fatal
         with self._lock:
             return self._latest
 
@@ -447,7 +561,105 @@ class IsaacTeleopReader:
                 with self._ctrl_lock:
                     self._latest_controller = controller
 
+            # OpenXR Extension Method: which full-body vendor tracker actually
+            # delivered active data this frame, straight from the runtime -- see
+            # IsaacTeleopClient._get_tracker_data(). Re-evaluated every frame (not
+            # cached) so a headset swap mid-session is picked up on the next poll.
+            # An explicit --skeleton-source never gets here (_manual_skeleton_source
+            # is set) and is honored regardless of what the extension reports.
+            if self._manual_skeleton_source is None:
+                full_body_source = raw.get("full_body_source")
+                # Diagnostic: log every observed value, not just changes we act on,
+                # so a stuck resolution shows up as a repeating line here instead of
+                # only inferred from the degeneracy guard downstream.
+                if full_body_source != self._last_seen_full_body_source:
+                    logger.info(
+                        "[IsaacTeleopReader] full_body_source: %r -> %r (resolved was %r)",
+                        self._last_seen_full_body_source,
+                        full_body_source,
+                        self.resolved_skeleton_source,
+                    )
+                    self._last_seen_full_body_source = full_body_source
+                if full_body_source is not None:
+                    try:
+                        self._apply_resolved_source(full_body_source)
+                    except SkeletonCorrectionUnavailable as exc:
+                        # Refuse rather than stream an uncorrected non-PICO
+                        # skeleton. Logging and continuing was tried first and is
+                        # not safe: the robot is driven with permuted joint axes
+                        # and falls, which is precisely what this detects.
+                        # Re-raised from get_latest() so it surfaces on the main
+                        # thread and stops the process, matching what an explicit
+                        # --skeleton-source quest does at startup.
+                        logger.error("[IsaacTeleopReader] %s", exc)
+                        self._fatal = exc
+                        self._stop.set()
+                        return
+
             body_poses = _body_data_to_24x7(raw.get("full_body"))
+
+            # Geometry degeneracy guard. This used to be the primary detection
+            # mechanism (AutoSkeletonSource, still in skeleton_source_detect.py);
+            # now that the OpenXR Extension Method says definitively which vendor
+            # produced this frame, geometry is repurposed as a safety check: does
+            # this skeleton's orientation convention actually match the resolved
+            # source -- the extension it arrived on in auto mode, or the source an
+            # explicit --skeleton-source forced? A mismatch means something is
+            # wrong -- a disconnected/misbehaving tracker, a skeleton sent over the
+            # wrong extension, or an operator's manual override not matching the
+            # headset that's actually connected -- and driving a robot from it
+            # risks permuted joint axes, so this refuses the frame rather than risk
+            # it. Applies in both manual and auto mode: a forced --skeleton-source
+            # is honored for *which correction to apply*, never for skipping this
+            # safety check.
+            #
+            if body_poses is not None and self.resolved_skeleton_source in ("pico", "quest"):
+                degenerate_source, degenerate_scores = classify(body_poses[:, :3], body_poses[:, 3:])
+                if degenerate_source is not None and degenerate_source != self.resolved_skeleton_source:
+                    now_ns = time.monotonic_ns()
+                    if now_ns - self._last_degenerate_log_ns > _DEGENERATE_LOG_INTERVAL_NS:
+                        self._last_degenerate_log_ns = now_ns
+                        logger.error(
+                            "[IsaacTeleopReader] DEGENERATE SKELETON: resolved source is "
+                            "%r but this frame's orientations read as %r (scores %s). "
+                            "Refusing to forward this frame to the robot control policy.",
+                            self.resolved_skeleton_source,
+                            degenerate_source,
+                            degenerate_scores,
+                        )
+                    time.sleep(self._period)
+                    continue
+
+            # Pico "motion trackers disconnected" guard. Separate from the geometry
+            # mismatch guard above: that one is a per-frame check of orientation
+            # convention (does this frame look like pico or quest), this one is a
+            # temporal check (has the torso been frozen to a constant pose for the
+            # last several frames) -- see skeleton_source_detect.py for how the
+            # signature was characterized and why it's BD-only for now. Only makes
+            # sense while resolved to pico, so the window is reset whenever we're
+            # not, to avoid a stale window from a previous pico session bleeding
+            # into a fresh one.
+            if self.resolved_skeleton_source == "pico" and body_poses is not None:
+                frozen = self._trackers_disconnected_detector.push(body_poses[:, :3], body_poses[:, 3:])
+                if frozen:
+                    now_ns = time.monotonic_ns()
+                    if now_ns - self._last_trackers_disconnected_log_ns > _DEGENERATE_LOG_INTERVAL_NS:
+                        self._last_trackers_disconnected_log_ns = now_ns
+                        logger.error(
+                            "[IsaacTeleopReader] DEGENERATE SKELETON: Pico motion trackers "
+                            "appear disconnected (torso/pelvis frozen to a constant pose). "
+                            "Refusing to forward this frame to the robot control policy.",
+                        )
+                    time.sleep(self._period)
+                    continue
+            else:
+                self._trackers_disconnected_detector.reset()
+
+            correct_fn = self._correct_fn
+            if body_poses is not None and correct_fn is not None:
+                body_poses[:, 3:] = correct_fn(
+                    body_poses[:, 3:], self._skeleton_profile
+                ).astype(body_poses.dtype)
             if body_poses is None:
                 if not self._unrecognised_logged and not _attr_or_item(
                     raw.get("full_body"), "joint_positions"

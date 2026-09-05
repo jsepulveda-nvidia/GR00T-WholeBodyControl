@@ -141,7 +141,10 @@ python gear_sonic/train_agent_trl.py \
 For quick testing, download the sample data from HuggingFace:
 
 ```bash
-hf download nvidia/GEAR-SONIC --include "sample_data/*" --local-dir .
+hf download nvidia/GEAR-SONIC \
+    --include "config.json" \
+    --include "sample_data/*" \
+    --local-dir .
 ```
 
 ---

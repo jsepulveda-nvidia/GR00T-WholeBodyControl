@@ -278,6 +278,8 @@ Common options:
 | `--deploy-obs-config` | *(default)* | Custom observation config for deploy.sh |
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
+| `--deploy-motor-kp-scale` | *(disabled)* | Hardware motor Kp scale specification forwarded to deploy.sh |
+| `--deploy-motor-kd-scale` | *(disabled)* | Hardware motor Kd scale specification forwarded to deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
 | `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
 
