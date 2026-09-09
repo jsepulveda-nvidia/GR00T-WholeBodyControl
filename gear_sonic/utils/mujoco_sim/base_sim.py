@@ -9,11 +9,13 @@ import os
 import pathlib
 from pathlib import Path
 import pickle
+import re
 import tempfile
 from threading import Lock, Thread
 import time
 from typing import Dict
 import xml.etree.ElementTree as ET
+import yaml
 
 import mujoco
 import mujoco.viewer
@@ -550,6 +552,13 @@ class BaseSimulator:
         self.viewer_dt = self.config.get("VIEWER_DT", 0.02)
         self._running = True
 
+        # Clear latency tmpfiles left from a previous session so the HUD
+        # never shows stale values before fresh measurements arrive.
+        import os as _os
+        _gear_sonic_deploy = Path(__file__).parents[3] / "gear_sonic_deploy"
+        for _f in ["/tmp/cxr_p2p_ms", str(_gear_sonic_deploy / "active_policy_name")]:
+            _os.remove(_f) if _os.path.exists(_f) else None
+
         self.robot = Robot(self.config)
 
         # Create the environment
@@ -584,7 +593,112 @@ class BaseSimulator:
         self._latency_zmq_sock.connect("tcp://localhost:5557")
         self._latency_zmq_sock.setsockopt(zmq.SUBSCRIBE, b"g1_debug")
 
+        # Lookahead window: deferred until first ZMQ message from g1_deploy, because
+        # g1_deploy writes /tmp/onnx_policy_dir (cleared above) before its first publish,
+        # so _parse_obs_window() can only find the correct policy dir after that point.
+        control_dt = self.config.get("CONTROL_DT", self.sim_dt)
+        self._policy_hz = 1.0 / control_dt
+        self._obs_window_source = "pending"
+        self._obs_window_frames = 10   # conservative default until resolved
+        self._obs_window_ms = 10 * (1000.0 / self._policy_hz)
+        print(
+            f"[LATENCY] Sim dt={self.sim_dt*1000:.1f}ms  Control dt={control_dt*1000:.1f}ms  "
+            f"Policy hz={self._policy_hz:.1f}Hz  (lookahead pending g1_deploy connection)",
+            flush=True,
+        )
+        source = "policy_config.json" if self._obs_window_source == "json" else "yaml"
+        print(
+            f"[LATENCY] Obs lookahead window ({source}): {self._obs_window_frames} frames "
+            f"@ {control_dt*1000:.1f}ms/frame = {self._obs_window_ms:.0f}ms",
+            flush=True,
+        )
+
         self.sim_thread = None
+
+    def _parse_obs_window(self) -> tuple[int, float]:
+        """Return (N_frames, lookahead_ms) for the active policy's lookahead window.
+
+        Priority:
+          1. policy_config.json alongside the model files — owned by this team,
+             updated whenever the policy is swapped.  Key: "lookahead_frames" (int).
+          2. Scan observation_config.yaml for *_Nframe_* observation names — owned
+             by a different team and may not reflect the current model.
+
+        Falls back to (0, 0.0) if neither source is readable.
+        """
+        repo_root = Path(__file__).parents[3]
+        # g1_deploy_onnx_ref (Docker) writes the active policy directory basename to
+        # gear_sonic_deploy/active_policy_name, which is on the shared bind mount.
+        # /tmp is NOT shared between Docker and host.
+        active_policy_file = repo_root / "gear_sonic_deploy" / "active_policy_name"
+        policy_dir: Path | None = None
+        try:
+            policy_name = active_policy_file.read_text().strip()
+            policy_dir = repo_root / "gear_sonic_deploy" / "policy" / policy_name
+        except Exception:
+            print(
+                "[LATENCY] gear_sonic_deploy/active_policy_name not found; skipping "
+                "policy_config.json lookup (will use yaml scan or ZMQ value).",
+                flush=True,
+            )
+
+        # --- Priority 1: explicit sidecar JSON (only when policy dir is known) ---
+        json_path = policy_dir / "policy_config.json" if policy_dir is not None else None
+        if json_path is not None:
+            try:
+                import json as _json
+                cfg_json = _json.loads(json_path.read_text())
+                n = int(cfg_json["lookahead_frames"])
+                if n > 0:
+                    self._obs_window_source = "json"
+                    return n, n * (1000.0 / self._policy_hz)
+            except FileNotFoundError:
+                pass  # sidecar not present yet — fall through to yaml
+            except Exception as exc:
+                print(f"[LATENCY] Could not read {json_path}: {exc}", flush=True)
+
+        # --- Priority 2: scan observation_config.yaml ---
+        obs_cfg_path = (policy_dir / "observation_config.yaml") if policy_dir is not None else None
+        _DEFAULT_FRAMES = 10
+        if obs_cfg_path is not None:
+            try:
+                with open(obs_cfg_path) as f:
+                    cfg = yaml.safe_load(f)
+                encoder_obs = cfg.get("encoder", {}).get("encoder_observations", [])
+                pattern = re.compile(r"_(\d+)frame_")
+                max_n = 0
+                for obs in encoder_obs:
+                    if not obs.get("enabled", True):
+                        continue
+                    m = pattern.search(obs.get("name", ""))
+                    if m:
+                        max_n = max(max_n, int(m.group(1)))
+                if max_n == 0:
+                    print(
+                        f"[LATENCY] No policy_config.json at {json_path} and yaml scan found "
+                        f"no Nframe entries; defaulting to {_DEFAULT_FRAMES} frames. "
+                        f"Create policy_config.json with {{\"lookahead_frames\": N}} to fix.",
+                        flush=True,
+                    )
+                    max_n = _DEFAULT_FRAMES
+                else:
+                    print(
+                        f"[LATENCY] No policy_config.json at {json_path}; "
+                        f"using yaml scan result of {max_n} frames (may not match deployed model). "
+                        f"Create policy_config.json with {{\"lookahead_frames\": N}} to override.",
+                        flush=True,
+                    )
+                return max_n, max_n * (1000.0 / self._policy_hz)
+            except Exception as exc:
+                print(f"[LATENCY] Could not parse obs config at {obs_cfg_path}: {exc}", flush=True)
+
+        # Policy dir unknown and no yaml to scan — default conservatively and let ZMQ override.
+        print(
+            f"[LATENCY] Policy dir unknown (g1_deploy not yet started?); defaulting to "
+            f"{_DEFAULT_FRAMES} frames. Will update from ZMQ when g1_deploy connects.",
+            flush=True,
+        )
+        return _DEFAULT_FRAMES, _DEFAULT_FRAMES * (1000.0 / self._policy_hz)
 
     def start_as_thread(self):
         self.sim_thread = Thread(target=self.start)
@@ -642,11 +756,75 @@ class BaseSimulator:
                     data = msgpack.unpackb(raw[topic_len:], raw=False)
                     marker_ts = data.get("latency_marker_ts", 0.0)
                     if marker_ts and marker_ts > 0.0:
-                        total_ms = (time.monotonic() - marker_ts) * 1000.0
+                        now = time.monotonic()
+                        p0_ms = float(data.get("p0_latency_ms", 0.0))
+                        onnx_recv = float(data.get("onnx_recv_ts_s", 0.0))
+                        onnx_send = float(data.get("onnx_send_ts_s", 0.0))
+                        # On first ZMQ message, g1_deploy has already written /tmp/onnx_policy_dir,
+                        # so now we can resolve the correct policy_config.json.
+                        if self._obs_window_source == "pending":
+                            self._obs_window_frames, self._obs_window_ms = self._parse_obs_window()
+                            frame_ms = 1000.0 / self._policy_hz
+                            print(
+                                f"[LATENCY] Obs lookahead resolved: {self._obs_window_frames} frames "
+                                f"@ {frame_ms:.1f}ms/frame = {self._obs_window_ms:.0f}ms "
+                                f"(source: {self._obs_window_source})",
+                                flush=True,
+                            )
+                        # ZMQ obs_window_frames reflects yaml obs names, which may not match the
+                        # deployed model. Only use it as fallback when no policy_config.json was found.
+                        zmq_frames = data.get("obs_window_frames")
+                        if zmq_frames is not None and int(zmq_frames) > 0:
+                            n = int(zmq_frames)
+                            frame_ms = 1000.0 / self._policy_hz
+                            if self._obs_window_source == "json":
+                                if n != self._obs_window_frames:
+                                    print(
+                                        f"[LATENCY] obs_window_frames from ZMQ={n} differs from "
+                                        f"policy_config.json={self._obs_window_frames}; "
+                                        f"trusting json (yaml may be stale).",
+                                        flush=True,
+                                    )
+                            else:
+                                if n != self._obs_window_frames:
+                                    print(
+                                        f"[LATENCY] obs_window_frames from ZMQ={n} "
+                                        f"(yaml had {self._obs_window_frames}); "
+                                        f"lookahead = {n} × {frame_ms:.1f}ms = {n*frame_ms:.0f}ms",
+                                        flush=True,
+                                    )
+                                    self._obs_window_frames = n
+                                self._obs_window_ms = n * frame_ms
+                        if onnx_recv > 0.0 and onnx_send > 0.0:
+                            p1_ms = (onnx_recv - marker_ts) * 1000.0
+                            # P2 folds in the lookahead window (policy observation delay).
+                            p2_ms = (onnx_send - onnx_recv) * 1000.0 + self._obs_window_ms
+                            p3_ms = (now - onnx_send) * 1000.0
+                        else:
+                            # Fallback: no ONNX timestamps — report combined pipeline time.
+                            pipeline_ms = (now - marker_ts) * 1000.0 + self._obs_window_ms
+                            p1_ms, p2_ms, p3_ms = 0.0, pipeline_ms, 0.0
+                        total_ms = p0_ms + p1_ms + p2_ms + p3_ms
                         print(
-                            f"[LATENCY →P1] ts={marker_ts:.6f}"
-                            f"  P3→P2→P1 total={total_ms:.2f}ms  (sim applied motor cmd)"
+                            f"[LATENCY →P3] ts={marker_ts:.6f}"
+                            f"  p0={p0_ms:.2f}ms  p1={p1_ms:.2f}ms  p2={p2_ms:.2f}ms  p3={p3_ms:.2f}ms",
+                            flush=True,
                         )
+                        print(f"  total_est={total_ms:.2f}ms", flush=True)
+                        # Write JSON breakdown for upstream HUD reporting.
+                        import json as _json
+                        try:
+                            with open("/tmp/cxr_p2p_ms", "w") as _f:
+                                _json.dump({
+                                    "ts": round(marker_ts, 6),
+                                    "p0": round(p0_ms, 2),
+                                    "p1": round(p1_ms, 2),
+                                    "p2": round(p2_ms, 2),
+                                    "p3": round(p3_ms, 2),
+                                    "total": round(total_ms, 2),
+                                }, _f)
+                        except OSError:
+                            pass
                 except zmq.Again:
                     pass
 

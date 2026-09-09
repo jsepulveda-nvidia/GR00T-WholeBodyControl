@@ -652,6 +652,7 @@ private:
         int heading_increment_idx = -1;
         int timestamp_monotonic_idx = -1;
         int latency_marker_ts_idx = -1;
+        int p0_latency_ms_idx = -1;
         // VR 3-point tracking fields (optional)
         int vr_position_idx = -1, vr_orientation_idx = -1, vr_compliance_idx = -1;
 
@@ -670,6 +671,7 @@ private:
             else if (f.name == "heading_increment") heading_increment_idx = static_cast<int>(i);
             else if (f.name == "timestamp_monotonic") timestamp_monotonic_idx = static_cast<int>(i);
             else if (f.name == "latency_marker_ts") latency_marker_ts_idx = static_cast<int>(i);
+            else if (f.name == "p0_latency_ms") p0_latency_ms_idx = static_cast<int>(i);
             // VR 3-point tracking fields
             else if (f.name == "vr_position") vr_position_idx = static_cast<int>(i);
             else if (f.name == "vr_orientation") vr_orientation_idx = static_cast<int>(i);
@@ -1536,7 +1538,17 @@ private:
           }
         }
 
-        // ===== Decode latency_marker_ts if present (profiling only) =====
+        // ===== Decode latency_marker_ts and p0_latency_ms if present (profiling only) =====
+        if (p0_latency_ms_idx >= 0) {
+          const auto& p0_buf = buffered_buffers_[p0_latency_ms_idx];
+          const auto& p0_field = buffered_header_.fields[p0_latency_ms_idx];
+          if (p0_field.dtype == "f64" && p0_buf.size() >= sizeof(double)) {
+            double val = 0.0;
+            std::memcpy(&val, p0_buf.data(), sizeof(double));
+            if (needs_swap) val = byte_swap(val);
+            latest_p0_latency_ms_ = val;
+          }
+        }
         if (latency_marker_ts_idx >= 0) {
           const auto& lm_buf = buffered_buffers_[latency_marker_ts_idx];
           const auto& lm_field = buffered_header_.fields[latency_marker_ts_idx];
@@ -1884,6 +1896,8 @@ private:
     /// Latest latency profiling marker timestamp (monotonic seconds from Process 3).
     /// Non-zero only when a marked frame was most recently decoded; consumed by caller.
     double latest_latency_marker_ts_ = 0.0;
+    /// Latest P0 latency (ms): headset pose capture → host receipt via CloudXR.
+    double latest_p0_latency_ms_ = 0.0;
 
 public:
     /// Return and consume the pending latency marker (0.0 if none since last call).
@@ -1891,6 +1905,12 @@ public:
         double ts = latest_latency_marker_ts_;
         latest_latency_marker_ts_ = 0.0;
         return ts;
+    }
+    /// Return the latest P0 latency in ms (0.0 if unavailable); does not consume.
+    double ConsumeP0LatencyMs() {
+        double ms = latest_p0_latency_ms_;
+        latest_p0_latency_ms_ = 0.0;
+        return ms;
     }
 };
 

@@ -1322,8 +1322,8 @@ class PoseStreamer:
         )
         self.yaw_accumulator = YawAccumulator()
 
-        # Latency profiling: fire a marker every 5 seconds
-        self._latency_marker_interval = 5.0
+        # Latency profiling: fire a marker every 1 second for finer-grained calibration
+        self._latency_marker_interval = 1.0
         self._next_marker_t = 0.0
         self._marker_seq = 0
 
@@ -1515,14 +1515,48 @@ class PoseStreamer:
         if buffer_is_full and not self.buffer_cleared:
             # Latency profiling: stamp a marker every _latency_marker_interval seconds
             now_mono = time.monotonic()
+            p0_latency_ms = float(sample.get("p0_latency_ms", 0.0))
             if now_mono >= self._next_marker_t:
                 latency_marker_ts = now_mono
                 self._marker_seq += 1
                 self._next_marker_t = now_mono + self._latency_marker_interval
-                print(
-                    f"[LATENCY P3→] seq={self._marker_seq} ts={latency_marker_ts:.6f}"
-                    f"  body_pose → ZMQ port 5556"
-                )
+                # Read the latest full-pipeline breakdown written by base_sim.py (Process 3).
+                # Falls back to p0-only if the file is absent (real-robot mode, no sim).
+                try:
+                    import json as _json
+                    with open("/tmp/cxr_p2p_ms") as _f:
+                        _ldata = _json.load(_f)
+                    _p1 = _ldata.get("p1")
+                    _p2 = _ldata.get("p2")
+                    _p3 = _ldata.get("p3")
+                    _tot = _ldata.get("total")
+                    _ts  = _ldata.get("ts", latency_marker_ts)
+                    if _p3 is not None:
+                        print(
+                            f"[LATENCY P1] seq={self._marker_seq}"
+                            f"  ts={_ts:.6f}  p0={p0_latency_ms:.2f}ms"
+                            f"  p1={_p1:.2f}ms  p2={_p2:.2f}ms  p3={_p3:.2f}ms",
+                            flush=True,
+                        )
+                        print(f"  total_est={_tot:.2f}ms", flush=True)
+                    else:
+                        _tot2 = p0_latency_ms + (_p1 or 0) + (_p2 or 0)
+                        print(
+                            f"[LATENCY P1] seq={self._marker_seq}"
+                            f"  ts={_ts:.6f}  p0={p0_latency_ms:.2f}ms"
+                            f"  p1={(_p1 or 0):.2f}ms  p2={(_p2 or 0):.2f}ms  p3=n/a",
+                            flush=True,
+                        )
+                        print(f"  total_est={_tot2:.2f}ms  (no sim, P3 absent)", flush=True)
+                except (OSError, Exception):
+                    # No downstream data yet — report only P0.
+                    print(
+                        f"[LATENCY P1] seq={self._marker_seq}"
+                        f"  ts={latency_marker_ts:.6f}  p0={p0_latency_ms:.2f}ms"
+                        f"  p1=n/a  p2=n/a  p3=n/a",
+                        flush=True,
+                    )
+                    print(f"  total_est=n/a  (awaiting downstream data)", flush=True)
             else:
                 latency_marker_ts = 0.0
 
@@ -1555,6 +1589,7 @@ class PoseStreamer:
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
                 ),
                 "latency_marker_ts": np.array([latency_marker_ts], dtype=np.float64),
+                "p0_latency_ms": np.array([p0_latency_ms], dtype=np.float64),
             }
 
             packed_message = pack_pose_message(numpy_data, topic="pose")

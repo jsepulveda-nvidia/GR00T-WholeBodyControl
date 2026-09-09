@@ -232,6 +232,14 @@ public:
 
     /// Set the latency marker timestamp to include in the next g1_debug publish (profiling).
     void SetLatencyMarkerTs(double ts) { pending_latency_marker_ts_ = ts; }
+    /// Set the P0 latency (ms) to include in the next g1_debug publish (profiling).
+    void SetP0LatencyMs(double ms) { pending_p0_latency_ms_ = ms; }
+    /// Set CLOCK_MONOTONIC seconds at the moment ONNX consumed this frame's input (p1 boundary).
+    void SetOnnxRecvTsS(double ts) { pending_onnx_recv_ts_s_ = ts; }
+    /// Set CLOCK_MONOTONIC seconds just before ONNX publishes its output (p2 boundary).
+    void SetOnnxSendTsS(double ts) { pending_onnx_send_ts_s_ = ts; }
+    /// Set once at startup from active encoder observation names; never cleared.
+    void SetObsWindowFrames(int n) { obs_window_frames_ = n; }
 
 private:
     zmq::context_t realtime_debug_context_;                ///< ZMQ context (1 I/O thread).
@@ -249,6 +257,10 @@ private:
 
     // -- Latency profiling --
     double pending_latency_marker_ts_ = 0.0;
+    double pending_p0_latency_ms_ = 0.0;
+    double pending_onnx_recv_ts_s_ = 0.0;  ///< steady_clock seconds when ONNX consumed input
+    double pending_onnx_send_ts_s_ = 0.0;  ///< steady_clock seconds just before ONNX published
+    int obs_window_frames_ = 0;            ///< Lookahead frames from encoder obs names; set once at init
 
     /// Non-blocking send of [topic][msgpack payload] over the PUB socket.
     void send_zmq_message(const std::string& topic, const msgpack::sbuffer& sbuf) {
@@ -288,11 +300,14 @@ private:
 
         // State-logger fields: 18 base + 2 optional heading
         // Visualisation fields: output_data_map_.size() (typically 11)
-        // +1 optional latency profiling field
+        // +1 optional latency_marker_ts, +1 optional p0_latency_ms
         int num_state_fields = has_heading_state ? 20 : 18;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         int num_latency_fields = (pending_latency_marker_ts_ > 0.0) ? 1 : 0;
-        pk.pack_map(num_state_fields + num_viz_fields + num_latency_fields);
+        int num_p0_fields = (pending_p0_latency_ms_ != 0.0) ? 1 : 0;
+        int num_onnx_ts_fields = (pending_onnx_recv_ts_s_ > 0.0) ? 2 : 0;  // recv + send together
+        int num_obs_frames_fields = (obs_window_frames_ > 0 && pending_onnx_recv_ts_s_ > 0.0) ? 1 : 0;
+        pk.pack_map(num_state_fields + num_viz_fields + num_latency_fields + num_p0_fields + num_onnx_ts_fields + num_obs_frames_fields);
 
         // ---- State-logger fields ----
 
@@ -403,7 +418,7 @@ private:
             pk.pack(heading_state.delta_heading);
         }
 
-        // ---- Latency profiling field (optional) ----
+        // ---- Latency profiling fields (optional) ----
         if (pending_latency_marker_ts_ > 0.0) {
             auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
             double now_s = static_cast<double>(now_ns) / 1e9;
@@ -414,6 +429,23 @@ private:
             pk.pack("latency_marker_ts");
             pk.pack(pending_latency_marker_ts_);
             pending_latency_marker_ts_ = 0.0;
+        }
+        if (pending_p0_latency_ms_ != 0.0) {
+            pk.pack("p0_latency_ms");
+            pk.pack(pending_p0_latency_ms_);
+            pending_p0_latency_ms_ = 0.0;
+        }
+        if (pending_onnx_recv_ts_s_ > 0.0) {
+            pk.pack("onnx_recv_ts_s");
+            pk.pack(pending_onnx_recv_ts_s_);
+            pk.pack("onnx_send_ts_s");
+            pk.pack(pending_onnx_send_ts_s_);
+            if (obs_window_frames_ > 0) {
+                pk.pack("obs_window_frames");
+                pk.pack(obs_window_frames_);
+            }
+            pending_onnx_recv_ts_s_ = 0.0;
+            pending_onnx_send_ts_s_ = 0.0;
         }
 
         // ---- Visualisation fields (from output_data_map_) ----

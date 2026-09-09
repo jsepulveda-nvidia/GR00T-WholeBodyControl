@@ -14,7 +14,9 @@ by ``install_scripts/install_pico.sh``).
 
 from __future__ import annotations
 
+import json
 import time
+import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,27 @@ import numpy as np
 import isaacteleop.deviceio as deviceio
 import isaacteleop.oxr as oxr
 from isaacteleop.cloudxr import CloudXRLauncher
+from isaacteleop.schema import MessageChannelMessages
+
+
+_P0_TMPFILE = Path("/tmp/cxr_p0_ms")
+_P2P_TMPFILE = Path("/tmp/cxr_p2p_ms")
+
+# Must match TELEOP_CHANNEL_UUID in App.tsx: v5('teleop_command', v5.DNS)
+_TELEOP_CHANNEL_UUID: bytes = uuid.uuid5(uuid.NAMESPACE_DNS, "teleop_command").bytes
+
+
+def _read_body_p0_ms() -> float:
+    """Read P0 latency written by the CloudXR subprocess to a tmpfs file.
+
+    The CloudXR runtime runs as a subprocess, so its in-process libcloudxr.so
+    atomic cannot be read directly via ctypes. Instead nv_protocol_50.cpp
+    writes the latest P0 value to /tmp/cxr_p0_ms every ~30 body frames.
+    """
+    try:
+        return float(_P0_TMPFILE.read_text())
+    except Exception:
+        return 0.0
 
 
 def _default_pose_vec() -> np.ndarray:
@@ -102,7 +125,13 @@ class IsaacTeleopClient:
         self._hand_tracker: Any = None
         self._controller_tracker: Any = None
         self._body_tracker: Any = None
+        self._hud_channel: Any = None  # MessageChannelTracker for sending latency to client HUD
         self._cloudxr_launcher: CloudXRLauncher | None = None
+        self._last_p2p_send_t: float = 0.0
+        # Clear any tmpfiles left from a previous session so stale latency values
+        # are never sent to the HUD before fresh measurements arrive.
+        _P0_TMPFILE.unlink(missing_ok=True)
+        _P2P_TMPFILE.unlink(missing_ok=True)
 
     def _clear_trackers_and_session_ref(self) -> None:
         """Clear held refs after ``ExitStack.close()`` or a failed connect."""
@@ -117,6 +146,7 @@ class IsaacTeleopClient:
         self._hand_tracker = None
         self._controller_tracker = None
         self._body_tracker = None
+        self._hud_channel = None
 
     def start_streaming(self) -> None:
         """Launch CloudXR + open OpenXR session + start DeviceIO trackers."""
@@ -138,11 +168,15 @@ class IsaacTeleopClient:
             self._hand_tracker = deviceio.HandTracker()
             self._controller_tracker = deviceio.ControllerTracker()
             self._body_tracker = deviceio.FullBodyTrackerPico()
+            self._hud_channel = deviceio.MessageChannelTracker(
+                _TELEOP_CHANNEL_UUID, "teleop_command"
+            )
             trackers = [
                 self._head_tracker,
                 self._hand_tracker,
                 self._controller_tracker,
                 self._body_tracker,
+                self._hud_channel,
             ]
             required_extensions = deviceio.DeviceIOSession.get_required_extensions(trackers)
             oxr_session = stack.enter_context(
@@ -187,14 +221,49 @@ class IsaacTeleopClient:
             return None
 
         session = self._deviceio_session
+        body_tracked = self._body_tracker.get_body_pose(session)
+        # P0 latency: read from tmpfs file written by the CloudXR subprocess.
+        p0_latency_ms = _read_body_p0_ms()
+        # Send Pose-to-Pose total latency to client HUD at most once per second.
+        self._try_send_p2p_latency(session)
         return {
             "left_controller": self._controller_tracker.get_left_controller(session).data,
             "right_controller": self._controller_tracker.get_right_controller(session).data,
             "head": self._head_tracker.get_head(session).data,
             "left_hand": self._hand_tracker.get_left_hand(session).data,
             "right_hand": self._hand_tracker.get_right_hand(session).data,
-            "full_body": self._body_tracker.get_body_pose(session).data,
+            "full_body": body_tracked.data,
+            "p0_latency_ms": p0_latency_ms,
         }
+
+    def _try_send_p2p_latency(self, session: Any) -> None:
+        """Send Pose-to-Pose total latency to the client HUD via the teleop message channel.
+
+        Reads /tmp/cxr_p2p_ms written by base_sim.py, throttled to 1 Hz so it doesn't
+        flood the channel. The client's App.tsx handles {"type": "poseToPose", "ms": <float>}.
+        """
+        if self._hud_channel is None:
+            return
+        now = time.monotonic()
+        if now - self._last_p2p_send_t < 1.0:
+            return
+        try:
+            data = json.loads(_P2P_TMPFILE.read_text())
+        except Exception:
+            return
+        try:
+            payload = json.dumps({
+                "type": "poseToPose",
+                "ms": data.get("total", 0),
+                "p0": data.get("p0", 0),
+                "p1": data.get("p1", 0),
+                "p2": data.get("p2", 0),
+                "p3": data.get("p3"),  # None means absent (real-robot fallback)
+            }).encode()
+            self._hud_channel.send_message(session, MessageChannelMessages(payload))
+            self._last_p2p_send_t = now
+        except Exception:
+            pass
 
     def get_pose_by_name(self, name: str) -> np.ndarray:
         """Return ``[x, y, z, qx, qy, qz, qw]`` for ``name`` ∈ {left_controller, right_controller, headset}."""

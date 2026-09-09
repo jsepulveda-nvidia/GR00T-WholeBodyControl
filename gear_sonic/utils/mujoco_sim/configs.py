@@ -70,6 +70,7 @@ def override_wbc_config(
         "VERSION": config.wbc_version,
         "SIMULATOR": config.simulator,
         "SIMULATE_DT": 1 / float(config.sim_frequency),
+        "CONTROL_DT": 1 / float(config.control_frequency),
         "ENABLE_OFFSCREEN": config.enable_offscreen,
         "ENABLE_ONSCREEN": config.enable_onscreen,
         "model_path": config.wbc_model_path,

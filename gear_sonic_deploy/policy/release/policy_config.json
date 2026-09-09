@@ -1,0 +1,4 @@
+{
+  "lookahead_frames": 10,
+  "_comment": "Number of future motion frames the encoder observes. Update this when swapping policy models. Examples: 10-frame policy -> 10, 4-frame policy -> 4."
+}

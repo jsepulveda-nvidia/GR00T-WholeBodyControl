@@ -468,6 +468,8 @@ class IsaacTeleopReader:
                 logger.info("[IsaacTeleopReader] Fresh data received, connection restored")
                 self._disconnected.clear()
 
+            p0_latency_ms = float(raw.get("p0_latency_ms", 0.0))
+
             sample = {
                 "body_poses_np": body_poses,
                 "timestamp_realtime": time.time(),
@@ -475,6 +477,7 @@ class IsaacTeleopReader:
                 "timestamp_ns": stamp_ns,
                 "dt": device_dt,
                 "fps": self._fps_ema,
+                "p0_latency_ms": p0_latency_ms,
             }
             with self._lock:
                 self._latest = sample

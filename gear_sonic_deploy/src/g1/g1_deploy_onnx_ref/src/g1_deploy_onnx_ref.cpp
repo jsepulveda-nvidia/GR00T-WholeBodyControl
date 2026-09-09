@@ -403,6 +403,9 @@ class G1Deploy {
     
     // Active encoder observation functions (for encoder input)
     std::vector<ActiveObservation> active_encoder_obs_functions_;
+
+    // Max lookahead frames found in encoder obs names (_Nframe_* pattern); 0 if none found.
+    int obs_window_frames_ = 0;
     
     // VR3Point index
     std::array<int, 3> actual_vr_3point_index = {-1, -1, -1};
@@ -1885,8 +1888,26 @@ class G1Deploy {
           throw std::runtime_error(oss.str());
         }
         
-        std::cout << "✓ Initialized " << active_encoder_obs_functions_.size() 
+        std::cout << "✓ Initialized " << active_encoder_obs_functions_.size()
                   << " encoder observations (total dim: " << encoder_offset << ")" << std::endl;
+
+        // Compute lookahead window from _Nframe_ pattern in obs names (e.g. motion_joint_positions_10frame_step1).
+        obs_window_frames_ = 0;
+        for (const auto& obs : active_encoder_obs_functions_) {
+            const std::string& name = obs.name;
+            size_t frame_pos = name.find("frame_");
+            if (frame_pos != std::string::npos && frame_pos > 0) {
+                size_t start = frame_pos;
+                while (start > 0 && isdigit(static_cast<unsigned char>(name[start - 1]))) --start;
+                if (start < frame_pos && start > 0 && name[start - 1] == '_') {
+                    int n = std::stoi(name.substr(start, frame_pos - start));
+                    obs_window_frames_ = std::max(obs_window_frames_, n);
+                }
+            }
+        }
+        if (obs_window_frames_ > 0) {
+            std::cout << "[LATENCY] Encoder lookahead window: " << obs_window_frames_ << " frames" << std::endl;
+        }
       }
       
       // =========================================================================
@@ -2435,7 +2456,23 @@ class G1Deploy {
       
       // Initialize observation function map
       InitializeObservationFunctions();
-      
+
+      // Write the policy directory to a tmpfile so downstream processes (base_sim.py)
+      // can locate the correct policy_config.json without hardcoding a directory name.
+      if (!obs_config_path.empty()) {
+          std::string policy_dir = obs_config_path.substr(0, obs_config_path.find_last_of("/\\"));
+          // Write the policy directory basename to a shared-mount path so the host-side
+          // Python (base_sim.py) can find it. /workspace/g1_deploy is bind-mounted from
+          // the host at GR00T-WholeBodyControl/gear_sonic_deploy, so /tmp is NOT shared.
+          std::string policy_name = policy_dir.substr(policy_dir.find_last_of("/\\") + 1);
+          if (FILE* f = fopen("/workspace/g1_deploy/active_policy_name", "w")) {
+              fprintf(f, "%s\n", policy_name.c_str());
+              fclose(f);
+              std::cout << "[LATENCY] Policy dir: " << policy_dir
+                        << " (name: " << policy_name << ")" << std::endl;
+          }
+      }
+
       // Log observation configuration details
       LogObservationConfiguration();
 
@@ -3983,19 +4020,34 @@ class G1Deploy {
           
           auto hand_joint_end_time = std::chrono::steady_clock::now();
 
-          // Collect latency marker from ZMQManager (if applicable) for profiling
+          // Collect latency marker and P0 from ZMQManager (if applicable) for profiling
           double latency_marker_ts = 0.0;
+          double p0_latency_ms = 0.0;
+          double onnx_recv_ts_s = 0.0;
           if (auto* zmq_mgr = dynamic_cast<ZMQManager*>(input_interface_.get())) {
             latency_marker_ts = zmq_mgr->ConsumeLatencyMarkerTs();
+            p0_latency_ms = zmq_mgr->ConsumeP0LatencyMs();
+            if (latency_marker_ts > 0.0) {
+              // Stamp when ONNX consumed this input frame (p1/p2 boundary).
+              onnx_recv_ts_s = std::chrono::duration<double>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
           }
 
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
           for (auto& output_interface : output_interfaces_) {
             if (output_interface) {
-              // Forward latency marker to ZMQ output for downstream measurement (Process 1)
-              if (latency_marker_ts > 0.0) {
-                if (auto* zmq_out = dynamic_cast<ZMQOutputHandler*>(output_interface.get())) {
-                  zmq_out->SetLatencyMarkerTs(latency_marker_ts);
+              // Forward latency marker and P0 to ZMQ output for downstream measurement (Process 1)
+              if (auto* zmq_out = dynamic_cast<ZMQOutputHandler*>(output_interface.get())) {
+                if (latency_marker_ts > 0.0) zmq_out->SetLatencyMarkerTs(latency_marker_ts);
+                if (p0_latency_ms != 0.0) zmq_out->SetP0LatencyMs(p0_latency_ms);
+                if (onnx_recv_ts_s > 0.0) {
+                  zmq_out->SetOnnxRecvTsS(onnx_recv_ts_s);
+                  // Stamp send time immediately before publish so it tightly brackets inference.
+                  zmq_out->SetOnnxSendTsS(std::chrono::duration<double>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count());
+                  // Report lookahead frames (constant; derived from encoder obs names at init).
+                  if (obs_window_frames_ > 0) zmq_out->SetObsWindowFrames(obs_window_frames_);
                 }
               }
               output_interface->publish(
