@@ -259,6 +259,7 @@ class IsaacTeleopClient:
                 "p1": data.get("p1", 0),
                 "p2": data.get("p2", 0),
                 "p3": data.get("p3"),  # None means absent (real-robot fallback)
+                "m2m": data.get("m2m"),  # Motion-to-Motion (t_input + p0+p1+p2+p3 + t_output)
             }).encode()
             self._hud_channel.send_message(session, MessageChannelMessages(payload))
             self._last_p2p_send_t = now

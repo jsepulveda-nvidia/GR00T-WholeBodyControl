@@ -805,12 +805,21 @@ class BaseSimulator:
                             pipeline_ms = (now - marker_ts) * 1000.0 + self._obs_window_ms
                             p1_ms, p2_ms, p3_ms = 0.0, pipeline_ms, 0.0
                         total_ms = p0_ms + p1_ms + p2_ms + p3_ms
+                        # Constants for hardware stages outside the software stack.
+                        _T_INPUT_MS = 65.0   # input device → first software sample
+                        _T_OUTPUT_MS = 100.0  # last command → physical robot motion
+                        motion_to_motion_ms = _T_INPUT_MS + total_ms + _T_OUTPUT_MS
                         print(
                             f"[LATENCY →P3] ts={marker_ts:.6f}"
                             f"  p0={p0_ms:.2f}ms  p1={p1_ms:.2f}ms  p2={p2_ms:.2f}ms  p3={p3_ms:.2f}ms",
                             flush=True,
                         )
-                        print(f"  total_est={total_ms:.2f}ms", flush=True)
+                        print(
+                            f"  total_est={total_ms:.2f}ms"
+                            f"  motion_to_motion={motion_to_motion_ms:.2f}ms"
+                            f"  (t_in={_T_INPUT_MS:.0f}ms + p2p + t_out={_T_OUTPUT_MS:.0f}ms)",
+                            flush=True,
+                        )
                         # Write JSON breakdown for upstream HUD reporting.
                         import json as _json
                         try:
@@ -822,6 +831,7 @@ class BaseSimulator:
                                     "p2": round(p2_ms, 2),
                                     "p3": round(p3_ms, 2),
                                     "total": round(total_ms, 2),
+                                    "m2m": round(motion_to_motion_ms, 2),
                                 }, _f)
                         except OSError:
                             pass
