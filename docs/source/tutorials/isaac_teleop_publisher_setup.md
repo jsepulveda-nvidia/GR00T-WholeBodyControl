@@ -107,9 +107,11 @@ For quick validation, the same client URL can also be opened in a desktop browse
 
 If you prefer to run the WebXR client from source instead of the hosted client, follow the CloudXR/WebXR build instructions linked from the [Isaac Teleop Quick Start](https://nvidia.github.io/IsaacTeleop/release/1.4.x/getting_started/quick_start.html).
 
-## Step 6: Start Camera Visualization
+## Step 6: Optional Camera Visualization
 
-Stream cameras to the headset via upstream IsaacTeleop's `camera_viz.sh`. If you don't have the IsaacTeleop repo yet, clone it first:
+To add camera streaming to the headset, keep the teleop streamer from Step 4 running and open a second terminal. Camera visualization uses the CloudXR runtime that the teleop streamer started.
+
+If you don't have the IsaacTeleop repo yet, clone it first:
 
 ```bash
 git clone --branch release/1.4.x --recurse-submodules https://github.com/NVIDIA/IsaacTeleop.git
@@ -118,10 +120,9 @@ git clone --branch release/1.4.x --recurse-submodules https://github.com/NVIDIA/
 Then create the environment for the camera visualization streamer:
 
 ```bash
-cd IsaacTeleop
-examples/camera_viz/camera_viz.sh setup
-source examples/camera_viz/.venv/bin/activate
-cd examples/camera_viz
+cd IsaacTeleop/examples/camera_viz
+./camera_viz.sh setup
+source .venv/bin/activate
 ```
 ### Optional: Camera Preview in a Window
 
@@ -153,8 +154,10 @@ Once you have this information, make sure the settings in your yaml config match
 Once you are certain you have valid yaml configured, shut down any preview windows and run instead with "--mode xr", which will stream frames to Isaac Teleop:
 
 ```bash
-./camera_viz.sh run configs/[YOUR_CAMERA].yaml --mode xr
+./camera_viz.sh run configs/[YOUR_CAMERA].yaml --mode xr --no-launch-cloudxr-runtime
 ```
+`--no-launch-cloudxr-runtime` reuses the runtime started in Step 4. Omit this flag only when running camera visualization on its own without the teleop streamer.
+
 This should also be consistent with the [instructions found at IsaacTeleop](https://nvidia.github.io/IsaacTeleop/release/1.4.x/references/camera_streaming.html).
 
 ## Troubleshooting
