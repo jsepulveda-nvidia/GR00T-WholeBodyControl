@@ -30,7 +30,7 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_data_collection.py                          # real robot (default)
     python gear_sonic/scripts/launch_data_collection.py --sim                    # MuJoCo sim
     python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer       # skip viewer
-    python gear_sonic/scripts/launch_data_collection.py --pico-input-source isaac-teleop  # in-process CloudXR / DeviceIO
+    python gear_sonic/scripts/launch_data_collection.py --pico-input-source xrt  # XRoboToolkit input
 """
 
 from dataclasses import dataclass
@@ -123,8 +123,8 @@ class DataCollectionLaunchConfig:
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
 
-    pico_input_source: str = "xrt"
-    """Teleop input source for pico_manager_thread_server.py (xrt or isaac-teleop)."""
+    pico_input_source: str = "isaac-teleop"
+    """Teleop input source for pico_manager_thread_server.py (isaac-teleop or xrt)."""
 
     pico_vis_vr3pt: bool = False
     """Enable VR 3-point visualization on the teleop streamer."""

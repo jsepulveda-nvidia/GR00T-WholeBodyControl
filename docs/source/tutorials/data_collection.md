@@ -17,8 +17,8 @@ A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under
 ```{admonition} Prerequisites
 :class: note
 1. **Completed the [Quick Start](../getting_started/quickstart.md)** — you can run the sim2sim loop (includes [installing the deployment](../getting_started/installation_deploy.md) and [downloading model checkpoints](../getting_started/download_models.md)).
-2. **Completed the [VR Teleop Setup](../getting_started/vr_teleop_setup.md)** — PICO hardware is calibrated and `.venv_teleop` is ready.
-3. **Camera server running on the robot** — see [Camera Server Setup](#camera-server-setup-on-robot) below. For simulation, the MuJoCo sim loop publishes camera images automatically — no camera server needed.
+2. **Completed the [VR Teleop Setup](../getting_started/vr_teleop_setup.md):** PICO hardware is calibrated, `.venv_teleop` is ready, and the Isaac Teleop Web Client can connect to the streamer.
+3. **Camera server running on the robot:** see {ref}`Camera Server Setup <camera-server-setup-on-robot>` below. For simulation, the MuJoCo sim loop publishes camera images automatically, so no camera server is needed.
 ```
 
 ---
@@ -38,6 +38,8 @@ This environment is separate from `.venv_teleop` and `.venv_sim` — the data ex
 ```
 
 ---
+
+(camera-server-setup-on-robot)=
 
 ## Camera Server Setup (On-Robot)
 
@@ -272,6 +274,7 @@ Common options:
 | `--sim / --no-sim` | `False` | Run deploy.sh in sim mode (also starts the sim loop) |
 | `--camera-host` | `localhost` | Camera server host (e.g., `192.168.123.164` for real robot) |
 | `--camera-port` | `5555` | Camera server port |
+| `--pico-input-source` | `isaac-teleop` | PICO input backend. Use `xrt` for XRoboToolkit. |
 | `--no-camera-viewer` | *(viewer on)* | Disable the camera viewer pane |
 | `--data-exporter-frequency` | `50` | Recording frequency (Hz) |
 | `--deploy-checkpoint` | *(default)* | Custom checkpoint path for deploy.sh |
@@ -332,6 +335,8 @@ source scripts/setup_env.sh
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```
+
+Connect the headset with the Web Client as described in [Isaac Teleop Setup](isaac_teleop_publisher_setup.md).
 
 **Terminal 4 — Data Exporter:**
 

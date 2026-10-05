@@ -68,6 +68,8 @@ You can use `--input-type zmq` with the PICO teleop streamer for a simple, strea
 1. **Completed the [Quick Start](../getting_started/quickstart.md)** — you can run the sim2sim loop.
 2. **PICO VR hardware is set up** — headset and controllers are connected, body tracking is working, and `.venv_teleop` is installed. See the [VR Teleop Setup](../getting_started/vr_teleop_setup.md) for installation and calibration.
 
+Connect the headset with the Web Client as described in [Isaac Teleop Setup](isaac_teleop_publisher_setup.md). To use XRoboToolkit, add `--input-source xrt`.
+
 ### Launch (Sim2Sim)
 
 Run three terminals:

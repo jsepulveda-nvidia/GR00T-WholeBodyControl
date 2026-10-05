@@ -23,6 +23,7 @@ This codebase serves as the foundation for:
 News
 ----
 
+- **[2026-09-14]** **Isaac Teleop 1.4 and AGX Orin support**: The PICO teleoperation workflow now uses Isaac Teleop 1.4 and supports Jetson AGX Orin alongside Jetson AGX Thor.
 - **[2026-08-31]** **SONIC deployment update** — added per-motor Kp/Kd scaling to reduce stumbling.
 - **[2026-07-23]** **SONIC v1.1 checkpoint** — released a robot-heading-normalized SONIC controller trained with wrist-pose augmentation for whole-body teleoperation and SONIC-backed VLA execution. See the `Model Card <model_card.html>`_ and `Download Models <getting_started/download_models.html#sonic-v11-checkpoint>`_.
 - **[06/16]** **Isaac Teleop Setup (CloudXR / DeviceIO, in-process)** — added bring-up docs for the in-process CloudXR path via ``isaacteleop[cloudxr]``, with no separate publisher container. See `Isaac Teleop Setup <tutorials/isaac_teleop_publisher_setup.html>`_.

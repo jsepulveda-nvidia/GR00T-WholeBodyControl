@@ -31,6 +31,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 
 ## News
 
+- **[2026-09-14]** **Isaac Teleop 1.4 and AGX Orin support**: The PICO teleoperation workflow now uses Isaac Teleop 1.4 and supports Jetson AGX Orin alongside Jetson AGX Thor.
 - **[2026-08-31]** **SONIC deployment update** — added per-motor Kp/Kd scaling to reduce stumbling.
 - **[2026-07-23]** **SONIC v1.1 checkpoint** — released a robot-heading-normalized SONIC controller trained with wrist-pose augmentation for whole-body teleoperation and SONIC-backed VLA execution. See the [Model Card](#model-card) and [Download Models](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/download_models.html#sonic-v11-checkpoint).
 - **[06/16]** **Isaac Teleop Setup (CloudXR / DeviceIO, in-process)** — added bring-up docs for the in-process CloudXR path via `isaacteleop[cloudxr]`, with no separate publisher container. See [Isaac Teleop Setup](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/isaac_teleop_publisher_setup.html).
@@ -214,7 +215,7 @@ SONIC supports real-time whole-body teleoperation via PICO VR headset, enabling 
 
 <p align="center"><em><strong>SONIC Low Latency:</strong> Whole-body teleoperation mode with a successful ground pickup.</em></p>
 
-This repo can also drive the headset over Isaac Teleop / CloudXR by launching `gear_sonic/scripts/pico_manager_thread_server.py --input-source isaac-teleop`. The streamer hosts the CloudXR runtime in-process via `isaacteleop[cloudxr]` — no separate publisher container required. That path is currently documented and supported only for **G1 with a Thor backpack**. The Isaac Teleop bring-up steps are documented in [`docs/source/tutorials/isaac_teleop_publisher_setup.md`](docs/source/tutorials/isaac_teleop_publisher_setup.md).
+For PICO teleoperation on **G1 with Jetson AGX Orin or Jetson AGX Thor**, follow the [`Isaac Teleop Setup`](docs/source/tutorials/isaac_teleop_publisher_setup.md). Launch `gear_sonic/scripts/pico_manager_thread_server.py --manager`. To use XRoboToolkit, add `--input-source xrt`.
 
 <div align="center">
 <table>

@@ -17,6 +17,7 @@
 # Optional env vars:
 #   SKIP_SIM_AND_UNITREE=1   Skip the mujoco sim extra and unitree_sdk2_python.
 #                            On aarch64 also skips the CycloneDDS C-lib build.
+#   INSTALL_XROBO_TOOLKIT=1  Also install the XRoboToolkit input backend.
 #   CYCLONEDDS_HOME=<path>   Override the CycloneDDS install prefix on aarch64
 #                            (default: ~/cyclonedds/install). Not used on
 #                            x86_64 because prebuilt cyclonedds wheels exist.
@@ -76,48 +77,11 @@ source .venv_teleop/bin/activate
 echo "[INFO] Installing gear_sonic[teleop] …"
 uv pip install -e "gear_sonic[teleop]"
 
-# ── 5. Install xrobotoolkit_sdk (CMake-based, not a pip package) ──────────────
-echo "[INFO] Installing XRoboToolkit SDK …"
-# Install cmake + pybind11 into the venv so the CMake-based build can find them.
-# Build with --no-build-isolation so CMake inherits the venv's pybind11.
-uv pip install cmake pybind11 setuptools
-echo "[OK] cmake $(cmake --version | head -1)"
-# Point CMake at pybind11's cmake config so find_package(pybind11) succeeds
-export CMAKE_PREFIX_PATH="$(python -m pybind11 --cmakedir)"
-echo "[OK] pybind11 cmake dir: $CMAKE_PREFIX_PATH"
-
-# On aarch64 (Jetson Orin), build the PXREARobotSDK native lib from source
-# because pre-built aarch64 binaries are not shipped in the repo.
-XRT_DIR="$REPO_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64"
-if [ "$ARCH" = "aarch64" ] && [ ! -f "$XRT_DIR/lib/aarch64/libPXREARobotSDK.so" ]; then
-    echo "[INFO] Building PXREARobotSDK for aarch64 (Jetson Orin) …"
-    XRT_TMP="$XRT_DIR/tmp"
-    mkdir -p "$XRT_TMP"
-    if [ ! -d "$XRT_TMP/XRoboToolkit-PC-Service" ]; then
-        git clone -b orin https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git "$XRT_TMP/XRoboToolkit-PC-Service"
-    fi
-    pushd "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK" > /dev/null
-    bash build.sh
-    popd > /dev/null
-    mkdir -p "$XRT_DIR/lib/aarch64" "$XRT_DIR/include/aarch64"
-    cp "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/PXREARobotSDK.h" \
-       "$XRT_DIR/include/aarch64/"
-    cp -r "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/nlohmann" \
-       "$XRT_DIR/include/aarch64/nlohmann/"
-    cp "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/build/libPXREARobotSDK.so" \
-       "$XRT_DIR/lib/aarch64/"
-    rm -rf "$XRT_TMP"
-    echo "[OK] PXREARobotSDK aarch64 native library built and installed"
-fi
-
-uv pip install --no-build-isolation -e external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/
-
-# ── 5c. Install isaacteleop[cloudxr] for the in-process CloudXR / DeviceIO path
-#       (--input-source isaac-teleop in pico_manager_thread_server.py).
-# Hosted on pypi.nvidia.com (public index, no auth). Replaces the legacy
-# multi-container path (./scripts/run_cloudxr_via_docker.sh + teleop_ros2_ref).
-echo "[INFO] Installing isaacteleop[cloudxr]~=1.3.0 from pypi.nvidia.com …"
-uv pip install 'isaacteleop[cloudxr]~=1.3.0' --prerelease=allow \
+# ── 5. Install the Isaac Teleop input backend
+# Isaac Teleop 1.4 selects the CloudXR runtime for supported x86_64 and Jetson
+# hosts automatically, including AGX Orin.
+echo "[INFO] Installing isaacteleop[cloudxr]~=1.4.0 from pypi.nvidia.com …"
+uv pip install 'isaacteleop[cloudxr]~=1.4.0' --prerelease=allow \
     --extra-index-url https://pypi.nvidia.com
 
 # Seed ~/cloudxr.env with the device profile CloudXRLauncher negotiates against.
@@ -129,7 +93,44 @@ else
     echo "[OK] $HOME/cloudxr.env already exists (leaving as-is)"
 fi
 
-# ── 5b, 6, 7: CycloneDDS C lib (aarch64) + sim extra + unitree_sdk2_python ────
+# ── 6. Optionally install the XRoboToolkit input backend
+if [ "${INSTALL_XROBO_TOOLKIT:-0}" = "1" ]; then
+    echo "[INFO] Installing XRoboToolkit SDK …"
+    # Build with venv-provided CMake and pybind11.
+    uv pip install cmake pybind11 setuptools
+    echo "[OK] cmake $(cmake --version | head -1)"
+    export CMAKE_PREFIX_PATH="$(python -m pybind11 --cmakedir)"
+    echo "[OK] pybind11 cmake dir: $CMAKE_PREFIX_PATH"
+
+    XRT_DIR="$REPO_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64"
+    if [ "$ARCH" = "aarch64" ] && [ ! -f "$XRT_DIR/lib/aarch64/libPXREARobotSDK.so" ]; then
+        echo "[INFO] Building PXREARobotSDK for aarch64 (Jetson Orin) …"
+        XRT_TMP="$XRT_DIR/tmp"
+        mkdir -p "$XRT_TMP"
+        if [ ! -d "$XRT_TMP/XRoboToolkit-PC-Service" ]; then
+            git clone -b orin https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git "$XRT_TMP/XRoboToolkit-PC-Service"
+        fi
+        pushd "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK" > /dev/null
+        bash build.sh
+        popd > /dev/null
+        mkdir -p "$XRT_DIR/lib/aarch64" "$XRT_DIR/include/aarch64"
+        cp "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/PXREARobotSDK.h" \
+           "$XRT_DIR/include/aarch64/"
+        cp -r "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/nlohmann" \
+           "$XRT_DIR/include/aarch64/nlohmann/"
+        cp "$XRT_TMP/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/build/libPXREARobotSDK.so" \
+           "$XRT_DIR/lib/aarch64/"
+        rm -rf "$XRT_TMP"
+        echo "[OK] PXREARobotSDK aarch64 native library built and installed"
+    fi
+
+    uv pip install --no-build-isolation \
+        -e external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/
+else
+    echo "[SKIP] XRoboToolkit is optional; set INSTALL_XROBO_TOOLKIT=1 to install it"
+fi
+
+# ── 7–9. CycloneDDS C lib (aarch64) + sim extra + unitree_sdk2_python
 # Skip when:
 #   • onboard unitree-provisioned image (aarch64 + user==unitree): the image
 #     already ships CycloneDDS, sim has no display, and the on-robot deploy
@@ -141,7 +142,7 @@ if { [ "$ARCH" = "aarch64" ] && [ "$(whoami)" = "unitree" ]; } \
    || [ "${SKIP_SIM_AND_UNITREE:-0}" = "1" ]; then
     echo "[SKIP] Skipping CycloneDDS build, sim extra & unitree_sdk2_python"
 else
-    # ── 5b. Build CycloneDDS C library on aarch64 (needed by the cyclonedds
+    # ── 7. Build CycloneDDS C library on aarch64 (needed by the cyclonedds
     #       Python binding which unitree_sdk2_python depends on).
     # x86_64 hosts get prebuilt cyclonedds wheels and skip this entirely.
     # Pattern follows Unitree's own README for this exact error
@@ -172,11 +173,11 @@ else
         export CYCLONEDDS_HOME="$CDDS_PREFIX"
     fi
 
-    # ── 6. Install sim extra (for run_sim_loop.py / sim2sim testing)
+    # ── 8. Install sim extra (for run_sim_loop.py / sim2sim testing)
     echo "[INFO] Installing sim extra …"
     uv pip install -e "gear_sonic[sim]"
 
-    # ── 7. Install unitree_sdk2_python (needed by the sim2sim bridge)
+    # ── 9. Install unitree_sdk2_python (needed by the sim2sim bridge)
     echo "[INFO] Installing unitree_sdk2_python …"
     uv pip install -e external_dependencies/unitree_sdk2_python
 fi
