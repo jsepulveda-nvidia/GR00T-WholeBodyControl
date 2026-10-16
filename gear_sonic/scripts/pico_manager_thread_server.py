@@ -558,16 +558,122 @@ class YawAccumulator:
         return self.heading
 
 
-def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndarray):
+class SkeletonCorrection:
+    """Maps a non-Pico skeleton's joint orientations onto the Pico convention.
+
+    Each joint gets a two-sided correction::
+
+        corrected[j] = left[j].inv() * local_rots[j] * right[j]
+
+    The left factor is the parent-frame rotation and decides which axis a motion
+    comes out about; the right factor is the child-frame relabelling and decides
+    the joint's rest orientation. A left multiply alone cannot do both, and
+    getting that wrong is invisible to static metrics while destabilising the
+    robot -- see utils/teleop/quest_skeleton_correction.py.
+    """
+
+    def __init__(self, left, right):
+        self.left = list(left)
+        self.right = list(right)
+
+    def apply(self, local_rots, positions=None, root_rot=None):
+        """Return ``local_rots`` rebased onto the Pico convention.
+
+        ``positions`` and ``root_rot`` are unused; kept so callers need not know
+        which correction flavour they hold.
+        """
+        return [
+            self.left[i].inv() * local_rots[i] * self.right[i]
+            for i in range(len(local_rots))
+        ]
+
+
+def load_wrist_bias(skeleton_source: str):
+    """Return ((L roll, L pitch, L yaw), (R roll, R pitch, R yaw)) in radians.
+
+    Added to the commanded G1 wrist joints. See WRIST_BIAS_RAD in
+    utils/teleop/quest_skeleton_correction.py for how the values were measured
+    and why Pico is deliberately zero.
+    """
+    from gear_sonic.utils.teleop.quest_skeleton_correction import WRIST_BIAS_RAD
+
+    bias = WRIST_BIAS_RAD.get(skeleton_source or "pico", ((0.0,) * 3, (0.0,) * 3))
+    if any(any(side) for side in bias):
+        d = lambda v: ", ".join(f"{np.degrees(x):+.1f}" for x in v)  # noqa: E731
+        print(
+            f"[skeleton] wrist bias for {skeleton_source!r} (roll, pitch, yaw deg): "
+            f"L [{d(bias[0])}]  R [{d(bias[1])}] "
+            "(neutral alignment; roll is zeroed rather than Pico-matched -- see "
+            "quest_skeleton_correction.py)"
+        )
+    return bias
+
+
+def load_skeleton_correction(skeleton_source: str):
+    """Return a SkeletonCorrection, or None for the native Pico path.
+
+    Quest body pose arrives already converted to the ByteDance 24-joint layout by
+    the CloudXR client SDK, but with different per-joint orientation conventions.
+    See utils/teleop/quest_skeleton_correction.py for how the offsets were
+    measured and which joints remain approximate.
+    """
+    if skeleton_source in (None, "pico"):
+        return None
+    if skeleton_source == "quest":
+        from gear_sonic.utils.teleop.quest_skeleton_correction import (
+            INFERRED_LEG_JOINTS,
+            QUEST_TO_PICO_LEFT,
+            QUEST_TO_PICO_RIGHT,
+            STATIC_ONLY_JOINTS,
+        )
+
+        left = [sRot.from_quat(q) for q in QUEST_TO_PICO_LEFT]
+        right = [sRot.from_quat(q) for q in QUEST_TO_PICO_RIGHT]
+
+        # Safety check on the root. The root's left factor also remaps which
+        # robot axis an operator rotation drives: a factor that is not near
+        # identity about each world axis sends operator yaw to robot pitch and
+        # operator pitch to robot roll, which destabilises the robot within
+        # ~30 deg of body rotation. Refuse to run rather than rediscover that on
+        # hardware.
+        for axis, name in (((0, 1, 0), "yaw"), ((1, 0, 0), "pitch"), ((0, 0, 1), "roll")):
+            mapped = left[0].inv().apply(axis)
+            if float(np.dot(mapped, axis)) < 0.9:
+                raise ValueError(
+                    f"root skeleton correction remaps operator {name} onto a different "
+                    f"robot axis ({np.round(mapped, 2).tolist()} instead of {list(axis)}). "
+                    "This is unsafe -- see the 'Root safety' section of "
+                    "quest_skeleton_correction.py. Refusing to start."
+                )
+
+        print(
+            "[skeleton] Applying two-sided Quest->Pico orientation correction "
+            "(axis mapping verified). "
+            f"Joints {STATIC_ONLY_JOINTS} are fitted from static poses only; "
+            f"leg joints {INFERRED_LEG_JOINTS} come from Quest vision inference "
+            "and degrade on deep flexion."
+        )
+        return SkeletonCorrection(left, right)
+    raise ValueError(f"unknown --skeleton-source {skeleton_source!r} (expected pico|quest)")
+
+
+def compute_from_body_poses(
+    parent_indices: list, device, body_poses_np: np.ndarray, skeleton_correction=None
+):
     """
     Compute local joints and body orientation from provided body_poses_np.
+
+    ``skeleton_correction`` is an optional SkeletonCorrection that rebases a
+    non-Pico skeleton onto the Pico orientation convention in parent-relative
+    space (see utils/teleop/quest_skeleton_correction.py). A plain length-24
+    sequence of scipy Rotations is also accepted.
     """
     positions = body_poses_np[:, :3]
     global_quats = body_poses_np[:, [6, 3, 4, 5]]
 
     # Convert to local rotations
-    global_rots = sRot.from_quat(global_quats, scalar_first=True)
-    global_rots = global_rots * sRot.from_euler("y", 180, degrees=True)
+    raw_global_rots = sRot.from_quat(global_quats, scalar_first=True)
+    global_rots = raw_global_rots * sRot.from_euler("y", 180, degrees=True)
 
     local_rots = []
     for i in range(24):
@@ -576,6 +682,19 @@ def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndar
         else:
             local_rot = global_rots[parent_indices[i]].inv() * global_rots[i]
             local_rots.append(local_rot)
+
+    # Rebase onto the Pico convention. Applied here, after the local rotations
+    # exist and before they become the SMPL pose, because that is the space the
+    # offsets were measured in.
+    if skeleton_correction is not None:
+        if hasattr(skeleton_correction, "apply"):
+            # The shoulder correction depends on where the arm is pointing, so
+            # it needs the positions and the root rotation, not just the index.
+            # Pass the RAW root: the arm-direction feature was sampled in the
+            # raw pelvis frame, before the Ry180 convention flip.
+            local_rots = skeleton_correction.apply(local_rots, positions, raw_global_rots[0])
+        else:
+            local_rots = [skeleton_correction[i].inv() * local_rots[i] for i in range(24)]
 
     pose_aa = np.array([rot.as_rotvec() for rot in local_rots])
 
@@ -1249,6 +1368,7 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        skeleton_source: str = "pico",
     ):
         self.socket = socket
         self.reader = reader
@@ -1270,6 +1390,8 @@ class PoseStreamer:
         self.record_idx = 0
 
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.skeleton_correction = load_skeleton_correction(skeleton_source)
+        self.wrist_bias = load_wrist_bias(skeleton_source)
         self.parent_indices = [
             -1,
             0,
@@ -1346,7 +1468,10 @@ class PoseStreamer:
             return
 
         latest_data = compute_from_body_poses(
-            self.parent_indices, self.device, sample["body_poses_np"]
+            self.parent_indices,
+            self.device,
+            sample["body_poses_np"],
+            skeleton_correction=self.skeleton_correction,
         )
         left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
             self.reader
@@ -1468,12 +1593,16 @@ class PoseStreamer:
         g1_r_wrist_yaw = r_elbow_swing_euler[:, 2] + r_wrist_euler[:, 2]
 
         joint_pos[G1_L_WRIST_ROLL_IDX] = g1_l_wrist_roll[0]
-        joint_pos[G1_L_WRIST_PITCH_IDX] = -g1_l_wrist_pitch[0]
-        joint_pos[G1_L_WRIST_YAW_IDX] = g1_l_wrist_yaw[0]
+        # Bias is per-headset and additive on the commanded joints; it aligns a
+        # non-Pico source with the Pico's tuned neutral. Zero for Pico.
+        (lb_roll, lb_pitch, lb_yaw), (rb_roll, rb_pitch, rb_yaw) = self.wrist_bias
+        joint_pos[G1_L_WRIST_ROLL_IDX] = g1_l_wrist_roll[0] + lb_roll
+        joint_pos[G1_L_WRIST_PITCH_IDX] = -g1_l_wrist_pitch[0] + lb_pitch
+        joint_pos[G1_L_WRIST_YAW_IDX] = g1_l_wrist_yaw[0] + lb_yaw
 
-        joint_pos[G1_R_WRIST_ROLL_IDX] = g1_r_wrist_roll[0]
-        joint_pos[G1_R_WRIST_PITCH_IDX] = g1_r_wrist_pitch[0]
-        joint_pos[G1_R_WRIST_YAW_IDX] = g1_r_wrist_yaw[0]
+        joint_pos[G1_R_WRIST_ROLL_IDX] = g1_r_wrist_roll[0] + rb_roll
+        joint_pos[G1_R_WRIST_PITCH_IDX] = g1_r_wrist_pitch[0] + rb_pitch
+        joint_pos[G1_R_WRIST_YAW_IDX] = g1_r_wrist_yaw[0] + rb_yaw
 
         # Process SMPL pose to get calibrated 3-point VR pose and update visualization
         # Pass SMPL local joints for optional body visualization in the VR3Pt viewer
@@ -1912,6 +2041,7 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    skeleton_source: str = "pico",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1953,6 +2083,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        skeleton_source=skeleton_source,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2251,6 +2382,18 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--skeleton-source",
+        type=str,
+        default="pico",
+        choices=["pico", "quest"],
+        help=(
+            "Headset providing body tracking. 'quest' applies a per-joint "
+            "orientation correction (see utils/teleop/quest_skeleton_correction.py); "
+            "the Quest skeleton reaches us in BD joint order but with different "
+            "orientation conventions. Manager mode only."
+        ),
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2292,6 +2435,7 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            skeleton_source=args.skeleton_source,
         )
     else:
         # Run legacy single-thread pose streaming
